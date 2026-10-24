@@ -1,0 +1,1861 @@
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
+import { apiClient } from '../shared/api/client';
+import { login, logout } from '../modules/auth/api';
+import { LoginForm } from '../modules/auth/components/LoginForm';
+import { fetchCompanySubscriptionAlert, fetchFeatureToggles, fetchOperationalContext } from '../modules/appcfg/api';
+import { fetchRestaurantBootstrap } from '../modules/restaurant/api';
+import type { OperationalContextResponse } from '../modules/appcfg/types';
+import {
+  clearAuthSession,
+  loadAuthSession,
+  onAuthSessionChanged,
+  saveAuthSession,
+} from '../modules/auth/storage';
+import type { AuthSession, LoginPayload } from '../modules/auth/types';
+
+type UiDensity = 'normal' | 'compact';
+type SalesFlowMode = 'DIRECT_CASHIER' | 'SELLER_TO_CASHIER';
+const UI_DENSITY_STORAGE_KEY = 'facturacion.uiDensity';
+
+type BusinessPulseRange = 'DAY' | 'MONTH' | 'YEAR';
+type BusinessPulsePoint = { label: string; sales: number; purchases: number };
+type BusinessPulseDataset = Record<BusinessPulseRange, BusinessPulsePoint[]>;
+
+const BUSINESS_PULSE_RANGES: BusinessPulseRange[] = ['DAY', 'MONTH', 'YEAR'];
+const BUSINESS_PULSE_EMPTY: BusinessPulseDataset = { DAY: [], MONTH: [], YEAR: [] };
+const BUSINESS_PULSE_CACHE_KEY = 'facturacion.businessPulseCache.v1';
+const BUSINESS_PULSE_CACHE_TTL_MS = 2 * 60 * 1000;
+
+type ModuleTab =
+  | 'home'
+  | 'cash'
+  | 'customer-collections'
+  | 'supplier-payments'
+  | 'racing-ops'
+  | 'restaurant-orders'
+  | 'comandas'
+  | 'tables'
+  | 'restaurant-recipes'
+  | 'sales'
+  | 'daily-summary'
+  | 'gre-guides'
+  | 'sunat-exceptions'
+  | 'inventory'
+  | 'purchases'
+  | 'reports'
+  | 'restaurant-menu'
+  | 'restaurant-supplies'
+  | 'products'
+  | 'customers'
+  | 'masters'
+  | 'appcfg'
+  | 'company';
+
+type MenuGroup =
+  | 'operacion'
+  | 'abastecimiento'
+  | 'catalogo'
+  | 'relaciones'
+  | 'administracion';
+
+const MENU_GROUPS: Array<{ id: MenuGroup; label: string }> = [
+  { id: 'operacion', label: 'Operacion diaria' },
+  { id: 'abastecimiento', label: 'Stock y compras' },
+  { id: 'catalogo', label: 'Catalogo maestro' },
+  { id: 'relaciones', label: 'Relacion comercial' },
+  { id: 'administracion', label: 'Configuracion' },
+];
+
+const QUICK_ACCESS_PRIORITY: ModuleTab[] = [
+  'home',
+  'sales',
+  'racing-ops',
+  'cash',
+  'customer-collections',
+  'supplier-payments',
+  'purchases',
+  'inventory',
+  'products',
+  'customers',
+  'daily-summary',
+  'reports',
+  'masters',
+  'appcfg',
+  'restaurant-orders',
+  'comandas',
+  'tables',
+  'restaurant-menu',
+  'restaurant-supplies',
+  'company',
+  'gre-guides',
+  'sunat-exceptions',
+];
+
+const RESTAURANT_TABS = new Set<ModuleTab>(['restaurant-orders', 'comandas', 'tables', 'restaurant-recipes']);
+const SELLER_HIDDEN_IN_SEPARATED_MODE = new Set<ModuleTab>([
+  'daily-summary',
+  'gre-guides',
+  'sunat-exceptions',
+]);
+const SALES_FLAGS_CACHE_KEY = 'facturacion.salesFlagsCache.v1';
+// Keep this short so admin feature flag changes propagate quickly in production.
+const SALES_FLAGS_CACHE_TTL_MS = 30 * 1000;
+const LAST_ACTIVE_TAB_STORAGE_KEY = 'facturacion.lastActiveTab.v1';
+const OPERATIONAL_CONTEXT_CACHE_KEY = 'facturacion.operationalContextCache.v1';
+const OPERATIONAL_CONTEXT_CACHE_TTL_MS = 30 * 60 * 1000;
+const LAST_SUCCESSFUL_DEVICE_ID_KEY = 'facturacion.auth.lastDeviceId';
+const SUBSCRIPTION_ALERT_DISMISS_KEY = 'facturacion.subscriptionAlertDismiss.v1';
+
+const loadCashView = () => import('../modules/cash/components/CashView');
+const HomeView = lazy(() => import('./HomeView').then((m) => ({ default: m.HomeView })));
+const RestaurantOrderView = lazy(() => import('../modules/restaurant/components/RestaurantOrderView').then((m) => ({ default: m.RestaurantOrderView })));
+const ComandasView = lazy(() => import('../modules/restaurant/components/ComandasView').then((m) => ({ default: m.ComandasView })));
+const TablesView = lazy(() => import('../modules/restaurant/components/TablesView').then((m) => ({ default: m.TablesView })));
+const RecipeEditorView = lazy(() => import('../modules/restaurant/components/RecipeEditorView').then((m) => ({ default: m.RecipeEditorView })));
+const loadSalesView = () => import('../modules/sales/components/SalesView');
+const CashView = lazy(() => loadCashView().then((m) => ({ default: m.CashView })));
+const RacingOperationsView = lazy(() => import('../modules/racing/components/RacingOperationsView').then((m) => ({ default: m.RacingOperationsView })));
+const SalesView = lazy(() => loadSalesView().then((m) => ({ default: m.SalesView })));
+const DailySummaryView = lazy(() => import('../modules/sales/components/DailySummaryView').then((m) => ({ default: m.DailySummaryView })));
+const GreGuidesView = lazy(() => import('../modules/sales/components/GreGuidesView').then((m) => ({ default: m.GreGuidesView })));
+const SunatExceptionsView = lazy(() => import('../modules/sales/components/SunatExceptionsView').then((m) => ({ default: m.SunatExceptionsView })));
+const RestaurantInventoryView = lazy(() => import('../modules/inventory/components/RestaurantInventoryView').then((m) => ({ default: m.RestaurantInventoryView })));
+const RetailInventoryView = lazy(() => import('../modules/inventory/components/RetailInventoryView').then((m) => ({ default: m.RetailInventoryView })));
+const RestaurantPurchasesView = lazy(() => import('../modules/purchases/components/RestaurantPurchasesView').then((m) => ({ default: m.RestaurantPurchasesView })));
+const RetailPurchasesView = lazy(() => import('../modules/purchases/components/RetailPurchasesView').then((m) => ({ default: m.RetailPurchasesView })));
+const ReportsCenterView = lazy(() => import('../modules/reports/components/ReportsCenterView').then((m) => ({ default: m.ReportsCenterView })));
+const CustomerCollectionsView = lazy(() => import('../modules/credit-payments/components/CustomerCollectionsView').then((m) => ({ default: m.CustomerCollectionsView })));
+const SupplierPaymentsView = lazy(() => import('../modules/credit-payments/components/SupplierPaymentsView').then((m) => ({ default: m.SupplierPaymentsView })));
+const RetailProductsView = lazy(() => import('../modules/products/components/RetailProductsView').then((m) => ({ default: m.RetailProductsView })));
+const RestaurantMenuProductsView = lazy(() => import('../modules/products/components/RestaurantMenuProductsView').then((m) => ({ default: m.RestaurantMenuProductsView })));
+const RestaurantSuppliesProductsView = lazy(() => import('../modules/products/components/RestaurantSuppliesProductsView').then((m) => ({ default: m.RestaurantSuppliesProductsView })));
+const CustomersView = lazy(() => import('../modules/customers/components/CustomersView').then((m) => ({ default: m.CustomersView })));
+const MastersView = lazy(() => import('../modules/masters/components/MastersView').then((m) => ({ default: m.MastersView })));
+const AppConfigView = lazy(() => import('../modules/appcfg/components/AppConfigView').then((m) => ({ default: m.AppConfigView })));
+const CompanyConfigView = lazy(() => import('../modules/company/components/CompanyConfigView').then((m) => ({ default: m.CompanyConfigView })));
+
+const MENU_ITEMS: Array<{
+  id: ModuleTab;
+  group: MenuGroup;
+  kicker: string;
+  label: string;
+  hint: string;
+  icon: React.ReactNode;
+  moduleCode?: string;
+  /**
+   * If set, this tab is ONLY visible when the active vertical matches one of
+   * these codes (case-insensitive). Add a new vertical here — no other code
+   * changes needed to gate the tab.
+   */
+  onlyVerticals?: string[];
+  /**
+   * Per-vertical label overrides. The base kicker/label/hint are the retail
+   * (default) values. Each vertical can override any or all three fields so
+   * the same underlying module feels native to that rubro.
+   * e.g. { RESTAURANT: { label: 'Menu del Restaurante', hint: 'Platos y bebidas' } }
+   */
+  verticalLabels?: Partial<Record<string, { kicker?: string; label?: string; hint?: string }>>;
+}> = [
+  {
+    id: 'home',
+    group: 'operacion',
+    kicker: 'Inicio',
+    label: 'Acceso rapido',
+    hint: 'Pantalla inicial con procesos frecuentes',
+    moduleCode: 'APPCFG',
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 10.5 12 3l9 7.5M5 9.5V21h14V9.5M10 21v-6h4v6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'cash',
+    group: 'operacion',
+    kicker: 'Tesoreria',
+    label: 'Caja',
+    hint: 'Sesiones y movimientos',
+    moduleCode: 'SALES',
+    verticalLabels: {
+      RESTAURANT: {
+        kicker: 'Caja del Dia',
+        label: 'Caja',
+        hint: 'Apertura de turno, cobros de mesas y cierre',
+      },
+    },
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 9h18v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9zm0 0V7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v2M9 13h6M12 13v4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'customer-collections',
+    group: 'operacion',
+    kicker: 'Cartera',
+    label: 'Cobros de Clientes',
+    hint: 'Seguimiento de creditos y recuperacion',
+    moduleCode: 'SALES',
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 6h18v12H3zM7 10h10M7 14h6M16.5 18a1.5 1.5 0 1 0 0 .01" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'supplier-payments',
+    group: 'abastecimiento',
+    kicker: 'Cartera',
+    label: 'Pagos a Proveedores',
+    hint: 'Control de deuda y cancelaciones',
+    moduleCode: 'INVENTORY',
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 7h18M5 7v12h14V7M8 11h8M8 15h4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'racing-ops',
+    group: 'operacion',
+    kicker: 'Rally',
+    label: 'Operacion Racing',
+    hint: 'Autos, mantenimiento, checklist y eventos',
+    moduleCode: 'INVENTORY',
+    onlyVerticals: ['RACING_OPERATIONS'],
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 14h2l2-4h9l2 4h3M7 14h10M8 10l1-3h6l1 3M7 17a1.5 1.5 0 1 0 0 .01M17 17a1.5 1.5 0 1 0 0 .01" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'restaurant-orders',
+    group: 'operacion',
+    kicker: 'Restaurante',
+    label: 'Pedidos',
+    hint: 'Crear órdenes por mesa',
+    moduleCode: 'SALES',
+    onlyVerticals: ['RESTAURANT'],
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2m-6 9 2 2 4-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'comandas',
+    group: 'operacion',
+    kicker: 'Restaurante',
+    label: 'Comandas',
+    hint: 'Cocina, mesa y despacho',
+    moduleCode: 'SALES',
+    onlyVerticals: ['RESTAURANT'],
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M7 4v8m10-8v8M4 12h16M6 20h12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'tables',
+    group: 'operacion',
+    kicker: 'Restaurante',
+    label: 'Mesas',
+    hint: 'Salones, capacidad y estado',
+    moduleCode: 'SALES',
+    onlyVerticals: ['RESTAURANT'],
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 10h18M6 10V6h12v4M7 10v8m10-8v8M4 18h16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'restaurant-recipes',
+    group: 'catalogo',
+    kicker: 'Restaurante',
+    label: 'Recetas',
+    hint: 'Ingredientes y cantidades por plato',
+    moduleCode: 'INVENTORY',
+    onlyVerticals: ['RESTAURANT'],
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2M12 12h4M12 16h4M8 12h.01M8 16h.01" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'sales',
+    group: 'operacion',
+    kicker: 'Ventas',
+    label: 'Comercial',
+    hint: 'Emision y seguimiento',
+    moduleCode: 'SALES',
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 5h16v4H4zM4 11h7v8H4zM13 11h7v3h-7zM13 16h7v3h-7z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'daily-summary',
+    group: 'operacion',
+    kicker: 'Ventas',
+    label: 'Resumen Diario',
+    hint: 'Declaracion y anulacion de boletas',
+    moduleCode: 'SALES',
+    verticalLabels: {
+      RESTAURANT: { kicker: 'SUNAT', hint: 'Declaracion diaria de boletas emitidas en el restaurante' },
+    },
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 4h16v4H4zM4 10h10v10H4zM16 14l2 2 4-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'gre-guides',
+    group: 'operacion',
+    kicker: 'SUNAT',
+    label: 'Guia GRE',
+    hint: 'Remitente, transportista y envio',
+    moduleCode: 'SALES',
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 6h10v12H4zM14 9h6v9h-6zM7 9h4m-4 3h4m-4 3h3" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'sunat-exceptions',
+    group: 'operacion',
+    kicker: 'SUNAT',
+    label: 'Excepciones',
+    hint: 'Pendientes y confirmacion manual',
+    moduleCode: 'SALES',
+    verticalLabels: {
+      RESTAURANT: { hint: 'Comprobantes del restaurante pendientes de envio a SUNAT' },
+    },
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 9v4m0 4h.01M4 20h16L12 4z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'inventory',
+    group: 'abastecimiento',
+    kicker: 'Stock',
+    label: 'Inventario',
+    hint: 'Existencias y lotes',
+    moduleCode: 'INVENTORY',
+    verticalLabels: {
+      RESTAURANT: {
+        kicker: 'Bodega',
+        label: 'Insumos y Bodega',
+        hint: 'Stock de ingredientes, bebidas e insumos de cocina',
+      },
+      RACING_OPERATIONS: {
+        kicker: 'Almacen',
+        label: 'Inventario Tecnico',
+        hint: 'Repuestos, herramientas, EPP, combustibles y llantas',
+      },
+    },
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 7 12 3l8 4-8 4zM4 11l8 4 8-4M4 15l8 4 8-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'purchases',
+    group: 'abastecimiento',
+    kicker: 'Abastecimiento',
+    label: 'Compras',
+    hint: 'Ingresos y ajustes',
+    moduleCode: 'INVENTORY',
+    verticalLabels: {
+      RESTAURANT: {
+        kicker: 'Cocina',
+        label: 'Compras de Insumos',
+        hint: 'Compras al proveedor: carnes, verduras, bebidas e insumos',
+      },
+      RACING_OPERATIONS: {
+        kicker: 'Abastecimiento',
+        label: 'Compras y Servicios',
+        hint: 'Proveedores, ordenes de compra y servicios externos',
+      },
+    },
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 6h3l2.2 10.2a1 1 0 0 0 1 .8H19a1 1 0 0 0 1-.8L22 9H8M10 20a1.2 1.2 0 1 0 0 .01M18 20a1.2 1.2 0 1 0 0 .01" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'reports',
+    group: 'abastecimiento',
+    kicker: 'Analitica',
+    label: 'Reportes',
+    hint: 'Centro unificado de reportes',
+    moduleCode: 'INVENTORY',
+    verticalLabels: {
+      RESTAURANT: {
+        hint: 'Ventas por mesa, platos mas vendidos y recaudacion diaria',
+      },
+      RACING_OPERATIONS: {
+        kicker: 'Analitica',
+        label: 'Reportes Operativos',
+        hint: 'Consumo, gastos por rally y rendimiento por auto',
+      },
+    },
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 20h16M6 16V9m6 7V5m6 11v-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'restaurant-menu',
+    group: 'catalogo',
+    kicker: 'Carta',
+    label: 'Menu',
+    hint: 'Platos, bebidas, combos y precios',
+    moduleCode: 'INVENTORY',
+    onlyVerticals: ['RESTAURANT'],
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 5h16v14H4zM8 9h8M8 13h8M8 17h5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'restaurant-supplies',
+    group: 'catalogo',
+    kicker: 'Bodega',
+    label: 'Insumos',
+    hint: 'Ingredientes, abarrotes y bebidas base',
+    moduleCode: 'INVENTORY',
+    onlyVerticals: ['RESTAURANT'],
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 7 12 3l8 4-8 4zM4 12l8 4 8-4M4 17l8 4 8-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'products',
+    group: 'catalogo',
+    kicker: 'Catalogo',
+    label: 'Productos',
+    hint: 'SKU, precios y estado',
+    moduleCode: 'INVENTORY',
+    verticalLabels: {
+      RESTAURANT: {
+        kicker: 'Carta',
+        label: 'Menu del Restaurante',
+        hint: 'Platos, bebidas, combos y precios de venta',
+      },
+      RACING_OPERATIONS: {
+        kicker: 'Catalogo',
+        label: 'Items Tecnicos',
+        hint: 'Repuestos, equipos, codigos internos e imagenes',
+      },
+    },
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 6h16v12H4zM8 10h8M8 14h5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'customers',
+    group: 'relaciones',
+    kicker: 'Relacion',
+    label: 'Clientes',
+    hint: 'Documentos y datos',
+    moduleCode: 'SALES',
+    verticalLabels: {
+      RESTAURANT: {
+        kicker: 'Salon',
+        label: 'Comensales',
+        hint: 'Clientes frecuentes, datos de facturacion y preferencias',
+      },
+      RACING_OPERATIONS: {
+        kicker: 'Ecosistema',
+        label: 'Terceros',
+        hint: 'Proveedores, talleres externos, transporte y servicios',
+      },
+    },
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm8 2a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM3 19a5 5 0 0 1 10 0M13 19a5 5 0 0 1 8 0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'masters',
+    group: 'catalogo',
+    kicker: 'Catalogos',
+    label: 'Maestros',
+    hint: 'Series, cajas y reglas',
+    moduleCode: 'APPCFG',
+    verticalLabels: {
+      RESTAURANT: {
+        hint: 'Series de comprobantes, modos de pago y configuracion de cajas',
+      },
+      RACING_OPERATIONS: {
+        kicker: 'Operacion',
+        label: 'Parametros de Rally',
+        hint: 'Reglas de mantenimiento, alertas y checklists operativos',
+      },
+    },
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 5h7v6H4zM13 5h7v4h-7zM13 11h7v8h-7zM4 13h7v6H4z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'appcfg',
+    group: 'administracion',
+    kicker: 'Sistema',
+    label: 'Configuracion',
+    hint: 'Permisos y limites',
+    moduleCode: 'APPCFG',
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 8.5A3.5 3.5 0 1 0 12 15.5 3.5 3.5 0 1 0 12 8.5zM3 12h2m14 0h2M12 3v2m0 14v2M5.7 5.7l1.4 1.4m9.8 9.8 1.4 1.4M18.3 5.7l-1.4 1.4m-9.8 9.8-1.4 1.4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'company',
+    group: 'administracion',
+    kicker: 'Empresa',
+    label: 'Mi Empresa',
+    hint: 'RUC, logo, certificado',
+    moduleCode: 'APPCFG',
+    icon: (
+      <svg className="menu-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 21h18M3 7l9-4 9 4M4 7v14M20 7v14M9 11h2v4H9zM13 11h2v4h-2zM9 19h6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+];
+
+const HIDDEN_TABS_BY_VERTICAL: Partial<Record<string, ModuleTab[]>> = {
+  RETAIL: ['comandas', 'tables', 'restaurant-recipes'],
+  RESTAURANT: ['sales', 'gre-guides', 'products'],
+  SERVICES: ['inventory', 'purchases', 'gre-guides'],
+  WORKSHOP: ['daily-summary', 'gre-guides'],
+};
+
+/**
+ * Determine whether a menu item should be visible for the active vertical.
+ *
+ * Rules (evaluated in order):
+ *  1. If the item declares `onlyVerticals`, it is EXCLUSIVE to those verticals.
+ *     Adding a new vertical's exclusive tab = set onlyVerticals on that item.
+ *     No other code change needed.
+ *  2. Otherwise fall through to the HIDDEN_TABS_BY_VERTICAL blocklist
+ *     (tabs that are universally redundant in a specific vertical).
+ *  3. With no vertical context, everything is visible (dev/demo mode).
+ */
+function isTabVisibleByVertical(
+  item: (typeof MENU_ITEMS)[number],
+  verticalCode: string | null,
+): boolean {
+  const code = (verticalCode ?? '').toUpperCase();
+
+  if (item.onlyVerticals?.length) {
+    return item.onlyVerticals.map((v) => v.toUpperCase()).includes(code);
+  }
+
+  if (!verticalCode) {
+    return true;
+  }
+
+  const hiddenTabs = HIDDEN_TABS_BY_VERTICAL[code] ?? [];
+  return !hiddenTabs.includes(item.id);
+}
+
+/**
+ * Apply per-vertical label overrides to a menu item.
+ * Returns { kicker, label, hint } with vertical-specific text when available,
+ * falling back to the generic (retail) defaults.
+ */
+function resolveVerticalLabel(
+  item: (typeof MENU_ITEMS)[number],
+  verticalCode: string | null,
+): { kicker: string; label: string; hint: string } {
+  const override = verticalCode
+    ? item.verticalLabels?.[verticalCode.toUpperCase()]
+    : undefined;
+  return {
+    kicker: override?.kicker ?? item.kicker,
+    label:  override?.label  ?? item.label,
+    hint:   override?.hint   ?? item.hint,
+  };
+}
+
+function resolveTenantAccessSlugFromPath(): string | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  const match = window.location.pathname.match(/^\/t\/([^/]+)/i);
+  if (!match || !match[1]) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(match[1]).trim().toLowerCase() || null;
+  } catch {
+    return String(match[1]).trim().toLowerCase() || null;
+  }
+}
+
+function resolveInitialActiveTab(): ModuleTab {
+  if (typeof window === 'undefined') {
+    return 'sales';
+  }
+
+  const saved = (window.localStorage.getItem(LAST_ACTIVE_TAB_STORAGE_KEY) ?? '').trim() as ModuleTab;
+  const allowed: ModuleTab[] = [
+    'home',
+    'cash',
+    'customer-collections',
+    'supplier-payments',
+    'racing-ops',
+    'restaurant-orders',
+    'comandas',
+    'tables',
+    'restaurant-recipes',
+    'sales',
+    'daily-summary',
+    'gre-guides',
+    'sunat-exceptions',
+    'inventory',
+    'purchases',
+    'reports',
+    'restaurant-menu',
+    'restaurant-supplies',
+    'restaurant-recipes',
+    'products',
+    'customers',
+    'masters',
+    'appcfg',
+    'company',
+  ];
+
+  return allowed.includes(saved) ? saved : 'sales';
+}
+
+export function App() {
+  const tenantAccessSlug = resolveTenantAccessSlugFromPath();
+  const authScope = tenantAccessSlug ? `tenant:${tenantAccessSlug}` : 'default';
+  const [session, setSession] = useState<AuthSession | null>(() => loadAuthSession(authScope));
+  const [isLoading, setIsLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<ModuleTab>(() => resolveInitialActiveTab());
+  const [menuSearch, setMenuSearch] = useState('');
+  const [context, setContext] = useState<OperationalContextResponse | null>(null);
+  const [selectedBranchId, setSelectedBranchId] = useState<number | null>(null);
+  const [selectedWarehouseId, setSelectedWarehouseId] = useState<number | null>(null);
+  const [selectedCashRegisterId, setSelectedCashRegisterId] = useState<number | null>(null);
+  const [isContextPickerOpen, setIsContextPickerOpen] = useState(false);
+  const [isContextLoading, setIsContextLoading] = useState(false);
+  const [isSessionDetailsOpen, setIsSessionDetailsOpen] = useState(false);
+  const [salesFlowMode, setSalesFlowMode] = useState<SalesFlowMode>('DIRECT_CASHIER');
+  const [restaurantQuickSaleEnabled, setRestaurantQuickSaleEnabled] = useState(false);
+  const [taxTraceabilityEnabled, setTaxTraceabilityEnabled] = useState(false);
+  const [activeVertical, setActiveVertical] = useState<OperationalContextResponse['active_vertical'] | null>(null);
+  const [businessPulseRange, setBusinessPulseRange] = useState<BusinessPulseRange>('DAY');
+  const [businessPulseData, setBusinessPulseData] = useState<BusinessPulseDataset>(BUSINESS_PULSE_EMPTY);
+  const [businessPulseLoading, setBusinessPulseLoading] = useState(false);
+  const [businessPulseError, setBusinessPulseError] = useState<string | null>(null);
+  const [subscriptionAlert, setSubscriptionAlert] = useState<{ tone: 'ok' | 'warn' | 'bad'; title: string; detail: string; signature: string } | null>(null);
+  const [uiDensity, setUiDensity] = useState<UiDensity>(() => {
+    if (typeof window === 'undefined') {
+      return 'compact';
+    }
+
+    const saved = window.localStorage.getItem(UI_DENSITY_STORAGE_KEY);
+    return saved === 'normal' ? 'normal' : 'compact';
+  });
+  const contentPanelRef = useRef<HTMLElement | null>(null);
+  const moduleExecutionRef = useRef<HTMLDivElement | null>(null);
+  const shouldScrollToModuleRef = useRef(false);
+  const hasHydratedOperationalContextRef = useRef(false);
+  const operationalContextInFlightKeyRef = useRef<string | null>(null);
+  const operationalContextLastCompletedKeyRef = useRef<string | null>(null);
+
+  const operationalContextScope = session
+    ? `${authScope}:${session.user.company_id}:${session.user.id}:${session.deviceId}`
+    : null;
+
+  useEffect(() => {
+    if (activeVertical?.code?.toUpperCase() !== 'RESTAURANT' || !selectedBranchId || !session?.accessToken) {
+      setRestaurantQuickSaleEnabled(false);
+      return;
+    }
+
+    let cancelled = false;
+    void fetchRestaurantBootstrap(session.accessToken, {
+      branchId: selectedBranchId,
+      warehouseId: selectedWarehouseId,
+      mode: 'orders_minimal',
+    }).then((bootstrap) => {
+      if (!cancelled) setRestaurantQuickSaleEnabled(Boolean(bootstrap.restaurant_quick_sale_enabled));
+    }).catch(() => {
+      if (!cancelled) setRestaurantQuickSaleEnabled(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeVertical?.code, selectedBranchId, selectedWarehouseId, session?.accessToken]);
+
+  useEffect(() => {
+    hasHydratedOperationalContextRef.current = false;
+    operationalContextInFlightKeyRef.current = null;
+    operationalContextLastCompletedKeyRef.current = null;
+    setContext(null);
+    setActiveVertical(null);
+    setSelectedBranchId(null);
+    setSelectedWarehouseId(null);
+    setSelectedCashRegisterId(null);
+  }, [session?.accessToken, session?.deviceId]);
+
+  useEffect(() => {
+    if (!operationalContextScope || typeof window === 'undefined') {
+      return;
+    }
+
+    const roleCode = (session?.user?.role_code ?? '').toUpperCase();
+    const roleProfile = (session?.user?.role_profile ?? '').toUpperCase();
+    const isAdmin = roleCode.includes('ADMIN');
+    const isCashier = roleProfile === 'CASHIER' || roleCode.includes('CAJA') || roleCode.includes('CAJER') || roleCode.includes('CASHIER');
+    const isSeller = roleProfile === 'SELLER' || roleCode.includes('VENDED') || roleCode.includes('SELLER');
+    const shouldSkipCashCacheHydration = salesFlowMode === 'DIRECT_CASHIER' && isSeller && !isCashier && !isAdmin;
+
+    try {
+      const raw = window.localStorage.getItem(OPERATIONAL_CONTEXT_CACHE_KEY);
+      if (!raw) {
+        return;
+      }
+
+      const parsed = JSON.parse(raw) as {
+        scope?: string;
+        generatedAt?: number;
+        active_vertical?: OperationalContextResponse['active_vertical'];
+        selected_branch_id?: number | null;
+        selected_warehouse_id?: number | null;
+        selected_cash_register_id?: number | null;
+      };
+
+      const generatedAt = Number(parsed.generatedAt ?? 0);
+      const isFresh = Number.isFinite(generatedAt)
+        && (Date.now() - generatedAt) <= OPERATIONAL_CONTEXT_CACHE_TTL_MS;
+
+      if (parsed.scope !== operationalContextScope || !isFresh) {
+        return;
+      }
+
+      if (parsed.active_vertical) {
+        setActiveVertical(parsed.active_vertical);
+      }
+
+      if (selectedBranchId === null && typeof parsed.selected_branch_id === 'number') {
+        setSelectedBranchId(parsed.selected_branch_id);
+      }
+
+      if (selectedWarehouseId === null && typeof parsed.selected_warehouse_id === 'number') {
+        setSelectedWarehouseId(parsed.selected_warehouse_id);
+      }
+
+      if (!shouldSkipCashCacheHydration && selectedCashRegisterId === null && typeof parsed.selected_cash_register_id === 'number') {
+        setSelectedCashRegisterId(parsed.selected_cash_register_id);
+      }
+    } catch {
+      // Ignore cache parsing issues.
+    }
+  }, [operationalContextScope, selectedBranchId, selectedCashRegisterId, selectedWarehouseId, session?.user?.role_code, session?.user?.role_profile, salesFlowMode]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(UI_DENSITY_STORAGE_KEY, uiDensity);
+  }, [uiDensity]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(LAST_ACTIVE_TAB_STORAGE_KEY, activeTab);
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    if (!shouldScrollToModuleRef.current) {
+      return;
+    }
+
+    if (!window.matchMedia('(max-width: 980px)').matches) {
+      shouldScrollToModuleRef.current = false;
+      return;
+    }
+
+    shouldScrollToModuleRef.current = false;
+
+    window.requestAnimationFrame(() => {
+      moduleExecutionRef.current?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'start',
+      });
+    });
+  }, [activeTab]);
+
+  useEffect(() => {
+    return onAuthSessionChanged((nextSession) => {
+      setSession(nextSession);
+    }, authScope);
+  }, [authScope]);
+
+  useEffect(() => {
+    if (!session?.accessToken) {
+      setSubscriptionAlert(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const alert = await fetchCompanySubscriptionAlert(session.accessToken);
+        if (cancelled || !alert.should_show) {
+          if (!cancelled) {
+            setSubscriptionAlert(null);
+          }
+          return;
+        }
+
+        const signature = `${session.user.company_id}:${alert.state}:${alert.due_date ?? ''}:${alert.days_overdue ?? ''}`;
+        const todayLima = new Intl.DateTimeFormat('sv-SE', {
+          timeZone: 'America/Lima',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+        }).format(new Date());
+        const dismissKey = `${signature}:${todayLima}`;
+
+        try {
+          const dismissed = window.localStorage.getItem(SUBSCRIPTION_ALERT_DISMISS_KEY);
+          if (dismissed === dismissKey) {
+            setSubscriptionAlert(null);
+            return;
+          }
+        } catch {
+          // Ignore localStorage read issues.
+        }
+
+        setSubscriptionAlert({
+          tone: alert.tone,
+          title: alert.title,
+          detail: alert.detail,
+          signature: dismissKey,
+        });
+      } catch {
+        if (!cancelled) {
+          setSubscriptionAlert(null);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.accessToken, session?.user?.company_id]);
+
+  useEffect(() => {
+    if (!session?.accessToken) {
+      return;
+    }
+
+    const normalizedRoleCode = (session.user.role_code ?? '').toUpperCase();
+    const normalizedRoleProfile = (session.user.role_profile ?? '').toUpperCase();
+    const isAdmin = normalizedRoleCode.includes('ADMIN');
+    const isCashier = normalizedRoleProfile === 'CASHIER'
+      || normalizedRoleCode.includes('CAJA')
+      || normalizedRoleCode.includes('CAJER')
+      || normalizedRoleCode.includes('CASHIER');
+    const isSeller = normalizedRoleProfile === 'SELLER'
+      || normalizedRoleCode.includes('VENDED')
+      || normalizedRoleCode.includes('SELLER');
+
+    // Keep initial startup lean: avoid preloading heavy cross-module chunks.
+    void isAdmin;
+    void isCashier;
+    void isSeller;
+    return undefined;
+  }, [session?.accessToken, session?.user?.role_code, session?.user?.role_profile]);
+
+  const fullName = useMemo(() => {
+    if (!session?.user) {
+      return '';
+    }
+
+    return `${session.user.first_name} ${session.user.last_name}`.trim();
+  }, [session]);
+
+  const normalizedRoleCode = (session?.user?.role_code ?? '').toUpperCase();
+  const normalizedRoleProfile = (session?.user?.role_profile ?? '').toUpperCase();
+  const isAdminUser = normalizedRoleCode.includes('ADMIN');
+  const isCashierUser = normalizedRoleProfile === 'CASHIER' || normalizedRoleCode.includes('CAJA') || normalizedRoleCode.includes('CAJER') || normalizedRoleCode.includes('CASHIER');
+  const isSellerUser = normalizedRoleProfile === 'SELLER'
+    || normalizedRoleProfile.includes('VENDED')
+    || normalizedRoleCode.includes('VENDED')
+    || normalizedRoleCode.includes('SELLER');
+  const shouldRequireManualCashSelection =
+    salesFlowMode === 'DIRECT_CASHIER'
+    && isSellerUser
+    && !isCashierUser
+    && !isAdminUser
+    && !Boolean(context?.selection_locks?.cash_register);
+  // In independent cashier mode, only cashier/admin should access cash module.
+  // In independent cashier mode, seller should not see Cash module.
+  // Cashier keeps access to Cash module for opening/closing/reconciliation.
+  const shouldHideCashModule =
+    salesFlowMode === 'SELLER_TO_CASHIER'
+    && !isCashierUser
+    && !isAdminUser;
+  const inventoryPermissions = session?.user?.permissions?.INVENTORY;
+  const appcfgPermissions = session?.user?.permissions?.APPCFG;
+  const canViewBusinessPulse = isAdminUser || Boolean(appcfgPermissions?.can_view);
+  const canEditPurchaseEntries = Boolean(inventoryPermissions?.can_update) && Boolean(inventoryPermissions?.can_approve);
+
+  const permittedMenuItems = useMemo(() => {
+    return MENU_ITEMS.filter((item) => {
+      if (item.id === 'home') {
+        return true;
+      }
+
+      if (item.id === 'cash' && shouldHideCashModule) {
+        return false;
+      }
+
+      if (item.id === 'comandas' && restaurantQuickSaleEnabled) {
+        return false;
+      }
+
+      if (
+        salesFlowMode === 'SELLER_TO_CASHIER'
+        && isSellerUser
+        && !isCashierUser
+        && !isAdminUser
+        && SELLER_HIDDEN_IN_SEPARATED_MODE.has(item.id)
+      ) {
+        return false;
+      }
+
+      if (!isTabVisibleByVertical(item, activeVertical?.code ?? null)) {
+        return false;
+      }
+
+      if (isAdminUser) {
+        return true;
+      }
+
+      if (!item.moduleCode) return true;
+      const perms = session?.user?.permissions;
+      if (!perms) return false;
+      const perm = perms[item.moduleCode];
+      if (!perm) return false;
+      return perm.can_view;
+    });
+  }, [
+    activeVertical?.code,
+    session?.user?.permissions,
+    shouldHideCashModule,
+    restaurantQuickSaleEnabled,
+    salesFlowMode,
+    isSellerUser,
+    isCashierUser,
+    isAdminUser,
+  ]);
+
+  useEffect(() => {
+    if (activeTab === 'comandas' && restaurantQuickSaleEnabled) {
+      setActiveTab('restaurant-orders');
+    }
+  }, [activeTab, restaurantQuickSaleEnabled]);
+
+  const filteredMenuItems = useMemo(() => {
+    const query = menuSearch.trim().toLowerCase();
+    if (!query) {
+      return permittedMenuItems;
+    }
+
+    return permittedMenuItems.filter((item) => {
+      const source = `${item.kicker} ${item.label} ${item.hint}`.toLowerCase();
+      return source.includes(query);
+    });
+  }, [permittedMenuItems, menuSearch]);
+
+  const activeMenuItem = useMemo(() => {
+    const item = MENU_ITEMS.find((m) => m.id === activeTab) ?? MENU_ITEMS[0];
+    const resolved = resolveVerticalLabel(item, activeVertical?.code ?? null);
+    return { ...item, ...resolved };
+  }, [activeTab, activeVertical?.code]);
+
+  const groupedMenuItems = useMemo(() => {
+    const grouped: Record<MenuGroup, typeof MENU_ITEMS> = {
+      operacion: [],
+      abastecimiento: [],
+      catalogo: [],
+      relaciones: [],
+      administracion: [],
+    };
+
+    filteredMenuItems.forEach((item) => {
+      grouped[item.group].push(item);
+    });
+
+    return grouped;
+  }, [filteredMenuItems]);
+
+  const quickAccessItems = useMemo(() => {
+    const priorityRank = new Map<ModuleTab, number>(
+      QUICK_ACCESS_PRIORITY.map((id, index) => [id, index]),
+    );
+
+    return [...permittedMenuItems]
+      .filter((item) => item.id !== 'home')
+      .sort((a, b) => {
+        const rankA = priorityRank.get(a.id) ?? Number.MAX_SAFE_INTEGER;
+        const rankB = priorityRank.get(b.id) ?? Number.MAX_SAFE_INTEGER;
+        return rankA - rankB;
+      })
+      .slice(0, 8)
+      .map((item) => {
+        const resolved = resolveVerticalLabel(item, activeVertical?.code ?? null);
+        return { ...item, ...resolved };
+      });
+  }, [activeVertical?.code, permittedMenuItems]);
+
+  function handleMenuTabSelect(nextTab: ModuleTab): void {
+    shouldScrollToModuleRef.current = true;
+    setActiveTab(nextTab);
+  }
+
+  async function handleLogin(payload: LoginPayload): Promise<void> {
+    setIsLoading(true);
+    setErrorMessage(null);
+
+    try {
+      const response = await login({
+        ...payload,
+        company_access_slug: tenantAccessSlug ?? undefined,
+      });
+      const nextSession: AuthSession = {
+        accessToken: response.access_token,
+        refreshToken: response.refresh_token,
+        expiresAt: response.access_expires_at,
+        deviceId: response.device_id,
+        user: response.user,
+      };
+
+      try {
+        window.localStorage.setItem(LAST_SUCCESSFUL_DEVICE_ID_KEY, response.device_id);
+      } catch {
+        // Ignore localStorage write issues.
+      }
+
+      saveAuthSession(nextSession, authScope);
+      setSession(nextSession);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'No se pudo iniciar sesion';
+      setErrorMessage(message);
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  async function handleLogout(): Promise<void> {
+    if (!session) {
+      return;
+    }
+
+    try {
+      await logout(session.accessToken);
+    } catch {
+      // Ignore API errors and clear local session anyway.
+    } finally {
+      clearAuthSession(authScope);
+      setSession(null);
+      setContext(null);
+      setActiveVertical(null);
+      setSelectedBranchId(null);
+      setSelectedWarehouseId(null);
+      setSelectedCashRegisterId(null);
+    }
+  }
+
+  async function loadOperationalContext(
+    accessToken: string,
+    branchId?: number | null,
+    warehouseId?: number | null,
+    cashRegisterId?: number | null
+  ): Promise<void> {
+    const requestKey = `${branchId ?? 'ALL'}:${warehouseId ?? 'ALL'}:${cashRegisterId ?? 'ALL'}`;
+
+    // Avoid startup waterfalls (branch-only -> branch+warehouse+cash) by allowing
+    // only one operational-context request in flight at a time.
+    if (operationalContextInFlightKeyRef.current !== null) {
+      return;
+    }
+
+    if (operationalContextLastCompletedKeyRef.current === requestKey && hasHydratedOperationalContextRef.current) {
+      return;
+    }
+
+    try {
+      operationalContextInFlightKeyRef.current = requestKey;
+      setIsContextLoading(true);
+      const nextContext = await fetchOperationalContext(accessToken, {
+        branchId,
+        warehouseId,
+        cashRegisterId,
+      });
+
+      const nextCashSelectionLocked = Boolean(nextContext.selection_locks?.cash_register);
+
+      setContext(nextContext);
+
+      const nextBranchId =
+        branchId ??
+        nextContext.selected.branch_id ??
+        nextContext.branches[0]?.id ??
+        null;
+      const nextWarehouseId =
+        warehouseId ??
+        nextContext.selected.warehouse_id ??
+        nextContext.warehouses.find((row) => row.branch_id === nextBranchId || row.branch_id === null)?.id ??
+        nextContext.warehouses[0]?.id ??
+        null;
+      const nextCashRegisterId =
+        nextCashSelectionLocked
+          ? (nextContext.selected.cash_register_id ?? null)
+          : (shouldRequireManualCashSelection && (cashRegisterId === null || cashRegisterId === undefined)
+            ? null
+            : (cashRegisterId ??
+            nextContext.selected.cash_register_id ??
+            nextContext.cash_registers.find((row) => (row.branch_id === nextBranchId || row.branch_id === null) && (row.warehouse_id === nextWarehouseId || row.warehouse_id === null))?.id ??
+            nextContext.cash_registers[0]?.id ??
+            null));
+
+      setSelectedBranchId(nextBranchId);
+      setSelectedWarehouseId(nextWarehouseId);
+      setSelectedCashRegisterId(nextCashRegisterId);
+      setActiveVertical(nextContext.active_vertical ?? null);
+
+      try {
+        if (typeof window !== 'undefined' && operationalContextScope) {
+          window.localStorage.setItem(
+            OPERATIONAL_CONTEXT_CACHE_KEY,
+            JSON.stringify({
+              scope: operationalContextScope,
+              generatedAt: Date.now(),
+              active_vertical: nextContext.active_vertical ?? null,
+              selected_branch_id: nextBranchId,
+              selected_warehouse_id: nextWarehouseId,
+              selected_cash_register_id: nextCashRegisterId,
+            }),
+          );
+        }
+      } catch {
+        // Ignore localStorage write issues.
+      }
+
+      hasHydratedOperationalContextRef.current = true;
+      operationalContextLastCompletedKeyRef.current = `${nextBranchId ?? 'ALL'}:${nextWarehouseId ?? 'ALL'}:${nextCashRegisterId ?? 'ALL'}`;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'No se pudo cargar contexto operativo';
+      setErrorMessage(message);
+    } finally {
+      if (operationalContextInFlightKeyRef.current === requestKey) {
+        operationalContextInFlightKeyRef.current = null;
+      }
+      setIsContextLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!session?.accessToken) {
+      return;
+    }
+
+    if (isContextLoading) {
+      return;
+    }
+
+    const initialBranch = session.user.branch_id ? Number(session.user.branch_id) : null;
+    const effectiveBranchId = selectedBranchId ?? initialBranch;
+
+    // Ensure first load is scope-aware in multi-company context.
+    if (selectedBranchId === null && initialBranch !== null) {
+      setSelectedBranchId(initialBranch);
+    }
+
+    // Ensure vertical-aware menu is hydrated on startup after hard refresh.
+    if (!hasHydratedOperationalContextRef.current && !isContextLoading && !activeVertical?.code) {
+      void loadOperationalContext(
+        session.accessToken,
+        effectiveBranchId,
+        selectedWarehouseId,
+        selectedCashRegisterId,
+      );
+      return;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.accessToken, activeTab, activeVertical?.code, isContextLoading, selectedBranchId, selectedCashRegisterId, selectedWarehouseId]);
+
+  useEffect(() => {
+    if (!session || !context || !hasHydratedOperationalContextRef.current) {
+      return;
+    }
+
+    // For restaurant tabs, keep context local and avoid reloading unrelated modules/cash context.
+    if (RESTAURANT_TABS.has(activeTab)) {
+      const nextWarehouseId = context.warehouses
+        .find((row) => row.branch_id === selectedBranchId || row.branch_id === null)?.id
+        ?? null;
+
+      if (selectedWarehouseId !== nextWarehouseId) {
+        setSelectedWarehouseId(nextWarehouseId);
+      }
+
+      return;
+    }
+
+    // Branch/warehouse/cash selectors already update local state; avoid auto-refetch cascade.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, context, selectedBranchId, selectedCashRegisterId, selectedWarehouseId, session]);
+
+  useEffect(() => {
+    if (!session) {
+      setSalesFlowMode('DIRECT_CASHIER');
+      setTaxTraceabilityEnabled(false);
+      return;
+    }
+
+    const initialBranch = session.user.branch_id ? Number(session.user.branch_id) : null;
+    const effectiveBranchId = selectedBranchId ?? initialBranch;
+    const cacheScope = `${session.user.company_id}:${effectiveBranchId ?? 'ALL'}`;
+    let cancelled = false;
+
+    try {
+      if (typeof window !== 'undefined') {
+        const raw = window.localStorage.getItem(SALES_FLAGS_CACHE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as {
+            scope?: string;
+            generatedAt?: number;
+            salesFlowMode?: SalesFlowMode;
+            taxTraceabilityEnabled?: boolean;
+          };
+
+          const generatedAt = Number(parsed.generatedAt ?? 0);
+          const isFresh = Number.isFinite(generatedAt) && (Date.now() - generatedAt) <= SALES_FLAGS_CACHE_TTL_MS;
+          if (parsed.scope === cacheScope && isFresh) {
+            setSalesFlowMode(parsed.salesFlowMode === 'SELLER_TO_CASHIER' ? 'SELLER_TO_CASHIER' : 'DIRECT_CASHIER');
+            setTaxTraceabilityEnabled(Boolean(parsed.taxTraceabilityEnabled));
+          }
+        }
+      }
+    } catch {
+      // Ignore cache parsing issues.
+    }
+
+    // Keep UX responsive with defaults, then resolve flags in background.
+    void (async () => {
+      try {
+        const featureRows = await fetchFeatureToggles(session.accessToken, effectiveBranchId);
+        if (cancelled) {
+          return;
+        }
+
+        const resolvedSalesFlowMode = featureRows.find((row) => row.feature_code === 'SALES_SELLER_TO_CASHIER')?.is_enabled
+          ? 'SELLER_TO_CASHIER'
+          : 'DIRECT_CASHIER';
+        const resolvedTaxTraceabilityEnabled = Boolean(
+          featureRows.find((row) => row.feature_code === 'SALES_TAX_BRIDGE')?.is_enabled
+        );
+
+        setSalesFlowMode(resolvedSalesFlowMode);
+        setTaxTraceabilityEnabled(resolvedTaxTraceabilityEnabled);
+
+        if (typeof window !== 'undefined') {
+          window.localStorage.setItem(
+            SALES_FLAGS_CACHE_KEY,
+            JSON.stringify({
+              scope: cacheScope,
+              generatedAt: Date.now(),
+              salesFlowMode: resolvedSalesFlowMode,
+              taxTraceabilityEnabled: resolvedTaxTraceabilityEnabled,
+            }),
+          );
+        }
+      } catch {
+        if (!cancelled) {
+          setSalesFlowMode('DIRECT_CASHIER');
+          setTaxTraceabilityEnabled(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [session, selectedBranchId]);
+
+  useEffect(() => {
+    if (!permittedMenuItems.find((item) => item.id === activeTab)) {
+      setActiveTab(permittedMenuItems[0]?.id ?? 'cash');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [permittedMenuItems]);
+
+  useEffect(() => {
+    if (shouldHideCashModule && activeTab === 'cash') {
+      const fallbackTab = permittedMenuItems.find((item) => item.id !== 'cash')?.id ?? 'sales';
+      setActiveTab(fallbackTab);
+    }
+  }, [activeTab, permittedMenuItems, shouldHideCashModule]);
+
+  useEffect(() => {
+    setIsContextPickerOpen(false);
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (!session) {
+      setIsSessionDetailsOpen(false);
+    }
+  }, [session]);
+
+  return (
+    <main className={`app-shell ${uiDensity === 'compact' ? 'density-compact' : ''}`}>
+      {!tenantAccessSlug && (
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', gap: '1rem', padding: '2rem', textAlign: 'center' }}>
+          <h1 style={{ fontSize: '1.5rem', fontWeight: 700 }}>Sistema de Facturación</h1>
+          <p style={{ color: '#555', maxWidth: '400px' }}>
+            Esta URL no corresponde a ninguna empresa.<br />
+            Accede con la URL de tu empresa, por ejemplo:<br />
+            <code style={{ background: '#f1f1f1', padding: '2px 6px', borderRadius: '4px' }}>
+              /t/emp-xxxxxxxxxxxxxxxx
+            </code>
+          </p>
+          <p style={{ color: '#888', fontSize: '0.85rem' }}>
+            Contacta al administrador del sistema para obtener tu URL de acceso.
+          </p>
+        </div>
+      )}
+      {tenantAccessSlug && (
+      <section className="hero">
+        <header className="workspace-head">
+          <div>
+            <p className="eyebrow">Facturacion</p>
+            <h1>Operaciones</h1>
+          </div>
+          <div className="workspace-status">
+            <span>API: {apiClient.baseUrl}</span>
+            <span>{session ? 'Sesion iniciada' : 'Sin sesion'}</span>
+            <label className="density-switch">
+              <span>Densidad</span>
+              <select
+                value={uiDensity}
+                onChange={(e) => setUiDensity(e.target.value as UiDensity)}
+                aria-label="Cambiar densidad visual"
+              >
+                <option value="normal">Normal</option>
+                <option value="compact">Compacto</option>
+              </select>
+            </label>
+          </div>
+        </header>
+
+        {!session && (
+          <>
+            <h2 className="section-title">Login</h2>
+            <LoginForm onSubmit={handleLogin} isLoading={isLoading} />
+          </>
+        )}
+
+        {errorMessage && <p className="error-box">{errorMessage}</p>}
+
+        {session && subscriptionAlert && (
+          <div className={`subscription-alert subscription-alert--${subscriptionAlert.tone}`} role="status" aria-live="polite">
+            <div>
+              <strong>{subscriptionAlert.title}</strong>
+              <p>{subscriptionAlert.detail}</p>
+            </div>
+            <button
+              type="button"
+              className="subscription-alert__close"
+              onClick={() => {
+                try {
+                  window.localStorage.setItem(SUBSCRIPTION_ALERT_DISMISS_KEY, subscriptionAlert.signature);
+                } catch {
+                  // Ignore localStorage write issues.
+                }
+                setSubscriptionAlert(null);
+              }}
+            >
+              Entendido
+            </button>
+          </div>
+        )}
+
+        {session && (
+          <section className="session-box">
+            <div className="session-inline">
+              <span className="session-pill">
+                Usuario: {fullName || session.user.username}
+              </span>
+              <span className="session-pill">
+                Empresa: {session.user.company_id} | Sucursal: {selectedBranchId ?? session.user.branch_id ?? 'N/A'}
+              </span>
+              <span className="session-pill">
+                Token: {session.expiresAt}
+              </span>
+              <div className="session-inline-actions">
+                <button
+                  type="button"
+                  className="session-toggle-btn"
+                  onClick={() => setIsSessionDetailsOpen((prev) => !prev)}
+                >
+                  {isSessionDetailsOpen ? 'Ocultar detalles' : 'Ver detalles'}
+                </button>
+                <button className="danger" onClick={handleLogout} type="button">
+                  Cerrar sesion
+                </button>
+              </div>
+            </div>
+
+            {isSessionDetailsOpen && (
+              <div className="session-summary">
+                <div>
+                  <span className="session-kicker">Sesion activa</span>
+                  <strong>{fullName || session.user.username}</strong>
+                  <small>@{session.user.username}</small>
+                </div>
+                <div>
+                  <span className="session-kicker">Empresa / Sucursal</span>
+                  <strong>{session.user.company_id}</strong>
+                  <small>{selectedBranchId ?? session.user.branch_id ?? 'N/A'}</small>
+                </div>
+                <div>
+                  <span className="session-kicker">Token</span>
+                  <strong>Expira</strong>
+                  <small>{session.expiresAt}</small>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {session && (
+          <section className="workspace-panel">
+            <aside className="menu-panel">
+              <label className="menu-search">
+                <span>Buscar modulo</span>
+                <input
+                  type="text"
+                  placeholder="Ej. caja, inventario, empresa..."
+                  value={menuSearch}
+                  onChange={(e) => setMenuSearch(e.target.value)}
+                />
+              </label>
+
+              <div className="menu-meta">
+                <span>{filteredMenuItems.length} modulos</span>
+                <span>Sucursal {selectedBranchId ?? 'N/A'}</span>
+                <span>Caja {selectedCashRegisterId ?? 'N/A'}</span>
+                <span>Rubro {activeVertical?.name ?? 'N/A'}</span>
+              </div>
+
+              <nav className="tab-nav" aria-label="Modulos del sistema">
+                {MENU_GROUPS.map((group) => {
+                  const items = groupedMenuItems[group.id];
+                  if (!items.length) {
+                    return null;
+                  }
+
+                  return (
+                    <section key={group.id} className="menu-group">
+                      <p className="menu-group-title">{group.label}</p>
+                      {items.map((item) => {
+                          const resolved = resolveVerticalLabel(item, activeVertical?.code ?? null);
+                          return (
+                        <button
+                          key={item.id}
+                          className={activeTab === item.id ? 'active' : ''}
+                          type="button"
+                          onClick={() => handleMenuTabSelect(item.id)}
+                          aria-current={activeTab === item.id ? 'page' : undefined}
+                        >
+                          <span className="menu-head">
+                            <span className="menu-icon-wrap">{item.icon}</span>
+                            <span>
+                              <span className="menu-kicker">{resolved.kicker}</span>
+                              <span className="menu-label">{resolved.label}</span>
+                              <span className="menu-sub">{resolved.hint}</span>
+                            </span>
+                          </span>
+                          <span className="menu-arrow" aria-hidden="true">&rsaquo;</span>
+                        </button>
+                          );
+                        })}
+                    </section>
+                  );
+                })}
+                {filteredMenuItems.length === 0 && (
+                  <p className="notice" style={{ margin: 0 }}>No hay modulos que coincidan con la busqueda.</p>
+                )}
+              </nav>
+            </aside>
+
+            <section ref={contentPanelRef} className="content-panel">
+              {activeTab === 'home' && (
+                <Suspense fallback={<p className="notice" style={{ margin: 0 }}>Cargando modulo...</p>}>
+                  <HomeView
+                    accessToken={session.accessToken}
+                    companyId={Number(session.user.company_id)}
+                    branchId={selectedBranchId}
+                    warehouseId={selectedWarehouseId}
+                    canViewBusinessPulse={canViewBusinessPulse}
+                    quickAccessItems={quickAccessItems}
+                    onTabSelect={(tab) => handleMenuTabSelect(tab as ModuleTab)}
+                  />
+                </Suspense>
+              )}
+
+              {activeTab !== 'home' && (
+              <header className="active-module-head">
+                <div>
+                  <p className="eyebrow">Seccion activa</p>
+                  <h2>{activeMenuItem.label}</h2>
+                  <p>{activeMenuItem.hint}</p>
+                </div>
+                <div className="active-module-meta active-module-meta-with-context">
+                  <span>{activeMenuItem.kicker}</span>
+                  <span>
+                    {selectedBranchId ? `S ${selectedBranchId}` : 'S -'} |
+                    {selectedWarehouseId ? ` A ${selectedWarehouseId}` : ' A -'} |
+                    {selectedCashRegisterId ? ` C ${selectedCashRegisterId}` : ' C -'}
+                  </span>
+
+                  <div className="active-context-actions" role="group" aria-label="Contexto operativo">
+                    <button
+                      type="button"
+                      className="context-toggle-btn"
+                      onClick={() => {
+                        const nextOpen = !isContextPickerOpen;
+                        setIsContextPickerOpen(nextOpen);
+
+                        if (
+                          nextOpen
+                          && session?.accessToken
+                          && !context
+                          && !isContextLoading
+                        ) {
+                          void loadOperationalContext(
+                            session.accessToken,
+                            selectedBranchId,
+                            selectedWarehouseId,
+                            selectedCashRegisterId,
+                          );
+                        }
+                      }}
+                    >
+                      {isContextPickerOpen ? 'Ocultar contexto' : 'Cambiar contexto'}
+                    </button>
+
+                    {isContextPickerOpen && (
+                      <div className="active-context-popover">
+                        {!context && (
+                          <p className="notice" style={{ margin: 0 }}>
+                            {isContextLoading ? 'Cargando contexto operativo...' : 'Contexto no disponible por el momento.'}
+                          </p>
+                        )}
+
+                        {context && (
+                          <>
+                          {context.station && (
+                            <p className="notice" style={{ margin: 0 }}>
+                              Estacion activa: {context.station.code} - {context.station.name}. Caja fija: {context.station.cash_register_code} - {context.station.cash_register_name}.
+                            </p>
+                          )}
+                          <label>
+                            <span>Sucursal</span>
+                            <select
+                              value={selectedBranchId ?? ''}
+                              disabled={Boolean(context.selection_locks?.branch)}
+                              onChange={(e) => {
+                                const value = e.target.value ? Number(e.target.value) : null;
+                                setSelectedBranchId(value);
+
+                                // Branch switch must refresh context once with the new branch scope.
+                                setSelectedWarehouseId(null);
+                                setSelectedCashRegisterId(null);
+
+                                if (session?.accessToken) {
+                                  void loadOperationalContext(
+                                    session.accessToken,
+                                    value,
+                                    null,
+                                    null,
+                                  );
+                                }
+                              }}
+                            >
+                              <option value="">Seleccionar</option>
+                              {context.branches.map((branch) => (
+                                <option key={branch.id} value={branch.id}>
+                                  {branch.code} - {branch.name}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+
+                          <label>
+                            <span>Almacen</span>
+                            <select
+                              value={selectedWarehouseId ?? ''}
+                              disabled={Boolean(context.selection_locks?.warehouse)}
+                              onChange={(e) => setSelectedWarehouseId(e.target.value ? Number(e.target.value) : null)}
+                            >
+                              <option value="">Seleccionar</option>
+                              {context.warehouses
+                                .filter((row) => row.branch_id === null || row.branch_id === selectedBranchId)
+                                .map((warehouse) => (
+                                  <option key={warehouse.id} value={warehouse.id}>
+                                    {warehouse.code} - {warehouse.name}
+                                  </option>
+                                ))}
+                            </select>
+                          </label>
+
+                          <label>
+                            <span>Caja</span>
+                            <select
+                              value={selectedCashRegisterId ?? ''}
+                              disabled={Boolean(context.selection_locks?.cash_register)}
+                              onChange={(e) => setSelectedCashRegisterId(e.target.value ? Number(e.target.value) : null)}
+                            >
+                              <option value="">Seleccionar</option>
+                              {context.cash_registers
+                                .filter((row) => (row.branch_id === null || row.branch_id === selectedBranchId) && (row.warehouse_id === null || row.warehouse_id === selectedWarehouseId))
+                                .map((cash) => (
+                                  <option key={cash.id} value={cash.id}>
+                                    {cash.code} - {cash.name}
+                                  </option>
+                                ))}
+                            </select>
+                          </label>
+
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                </div>
+              </header>
+              )}
+
+              <div ref={moduleExecutionRef} aria-hidden="true" />
+
+              <Suspense fallback={<p className="notice" style={{ margin: 0 }}>Cargando modulo...</p>}>
+                {activeTab === 'home' && null}
+                {activeTab === 'cash' && (
+                  <CashView
+                    accessToken={session.accessToken}
+                    cashRegisterId={selectedCashRegisterId}
+                    salesFlowMode={salesFlowMode}
+                    canViewNetMargin={false}
+                  />
+                )}
+                {activeTab === 'customer-collections' && (
+                  <CustomerCollectionsView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                    cashRegisterId={selectedCashRegisterId}
+                  />
+                )}
+                {activeTab === 'supplier-payments' && (
+                  <SupplierPaymentsView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                  />
+                )}
+                {activeTab === 'racing-ops' && (
+                  <RacingOperationsView accessToken={session.accessToken} />
+                )}
+                {activeTab === 'restaurant-orders' && (
+                  <RestaurantOrderView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                    warehouseId={selectedWarehouseId}
+                    cashRegisterId={selectedCashRegisterId}
+                  />
+                )}
+                {activeTab === 'comandas' && (
+                  <ComandasView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                    warehouseId={selectedWarehouseId}
+                    cashRegisterId={selectedCashRegisterId}
+                  />
+                )}
+                {activeTab === 'tables' && (
+                  <TablesView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                  />
+                )}
+                {activeTab === 'restaurant-recipes' && (
+                  <RecipeEditorView
+                    accessToken={session.accessToken}
+                    warehouseId={selectedWarehouseId}
+                  />
+                )}
+                {activeTab === 'sales' && (
+                  <SalesView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                    warehouseId={selectedWarehouseId}
+                    cashRegisterId={selectedCashRegisterId}
+                    activeVerticalCode={activeVertical?.code ?? null}
+                    currentUserRoleCode={session.user.role_code ?? null}
+                    currentUserRoleProfile={session.user.role_profile ?? null}
+                  />
+                )}
+                {activeTab === 'daily-summary' && (
+                  <DailySummaryView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                    traceabilityEnabled={taxTraceabilityEnabled}
+                  />
+                )}
+                {activeTab === 'gre-guides' && (
+                  <GreGuidesView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                    traceabilityEnabled={taxTraceabilityEnabled}
+                  />
+                )}
+                {activeTab === 'sunat-exceptions' && (
+                  <SunatExceptionsView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                  />
+                )}
+                {activeTab === 'inventory' && (
+                  (activeVertical?.code ?? '').toUpperCase() === 'RESTAURANT' ? (
+                    <RestaurantInventoryView
+                      accessToken={session.accessToken}
+                      warehouseId={selectedWarehouseId}
+                      activeVerticalCode={activeVertical?.code ?? null}
+                    />
+                  ) : (
+                    <RetailInventoryView
+                      accessToken={session.accessToken}
+                      warehouseId={selectedWarehouseId}
+                      activeVerticalCode={activeVertical?.code ?? null}
+                    />
+                  )
+                )}
+                {activeTab === 'purchases' && (
+                  (activeVertical?.code ?? '').toUpperCase() === 'RESTAURANT' ? (
+                    <RestaurantPurchasesView
+                      accessToken={session.accessToken}
+                      warehouseId={selectedWarehouseId}
+                      activeVerticalCode={activeVertical?.code ?? null}
+                      canEditPurchaseEntries={canEditPurchaseEntries}
+                    />
+                  ) : (
+                    <RetailPurchasesView
+                      accessToken={session.accessToken}
+                      warehouseId={selectedWarehouseId}
+                      activeVerticalCode={activeVertical?.code ?? null}
+                      canEditPurchaseEntries={canEditPurchaseEntries}
+                    />
+                  )
+                )}
+                {activeTab === 'reports' && (
+                  <ReportsCenterView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                    warehouseId={selectedWarehouseId}
+                  />
+                )}
+                {activeTab === 'products' && (
+                  <RetailProductsView
+                    accessToken={session.accessToken}
+                    activeVerticalCode={activeVertical?.code ?? null}
+                  />
+                )}
+                {activeTab === 'restaurant-menu' && (
+                  <RestaurantMenuProductsView
+                    accessToken={session.accessToken}
+                    activeVerticalCode={activeVertical?.code ?? null}
+                  />
+                )}
+                {activeTab === 'restaurant-supplies' && (
+                  <RestaurantSuppliesProductsView
+                    accessToken={session.accessToken}
+                    activeVerticalCode={activeVertical?.code ?? null}
+                  />
+                )}
+                {activeTab === 'customers' && (
+                  <CustomersView accessToken={session.accessToken} />
+                )}
+                {activeTab === 'masters' && (
+                  <MastersView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                    warehouseId={selectedWarehouseId}
+                    currentUserRoleCode={session.user.role_code ?? null}
+                    activeVerticalCode={activeVertical?.code ?? null}
+                  />
+                )}
+                {activeTab === 'appcfg' && (
+                  <AppConfigView
+                    accessToken={session.accessToken}
+                    branchId={selectedBranchId}
+                    warehouseId={selectedWarehouseId}
+                    cashRegisterId={selectedCashRegisterId}
+                    currentUserRoleCode={session.user.role_code ?? null}
+                    activeVerticalCode={activeVertical?.code ?? null}
+                  />
+                )}
+                {activeTab === 'company' && (
+                  <CompanyConfigView accessToken={session.accessToken} />
+                )}
+              </Suspense>
+            </section>
+          </section>
+        )}
+      </section>
+      )}
+    </main>
+  );
+}

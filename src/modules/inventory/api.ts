@@ -1,0 +1,675 @@
+import { apiClient } from '../../shared/api/client';
+import type {
+  InventoryLotRow,
+  InventoryProduct,
+  InventoryStockRow,
+  KardexRow,
+  KardexMeta,
+  InventoryProDashboardResponse,
+  InventoryProDailySnapshotResponse,
+  InventoryProLotExpiryResponse,
+  InventoryProReportRequestsResponse,
+  InventoryProReportRequestCreateResponse,
+  InventoryProReportRequestDetailResponse,
+  ReportsApiReportCode,
+} from './types';
+
+function authHeaders(accessToken: string): HeadersInit {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+  };
+}
+
+export async function fetchInventoryProducts(
+  accessToken: string,
+  params?: { search?: string; warehouseId?: number | null; status?: number | null; limit?: number; autocomplete?: boolean; cacheBust?: string }
+): Promise<InventoryProduct[]> {
+  const query = new URLSearchParams();
+  const defaultLimit = params?.autocomplete ? 50 : 50000;
+  query.set('limit', String(params?.limit ?? defaultLimit));
+
+  if (params?.search) {
+    query.set('search', params.search);
+  }
+  if (params?.warehouseId) {
+    query.set('warehouse_id', String(params.warehouseId));
+  }
+  if (params?.status === 0 || params?.status === 1) {
+    query.set('status', String(params.status));
+  }
+  if (params?.autocomplete) {
+    query.set('autocomplete', 'true');
+  }
+  if (params?.cacheBust) {
+    query.set('_refresh', params.cacheBust);
+  }
+
+  const response = await apiClient.request<{ data: InventoryProduct[] }>(`/api/inventory/products?${query.toString()}`, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+
+  return response.data;
+}
+
+export async function createInventoryProduct(
+  accessToken: string,
+  payload: {
+    sku?: string | null;
+    barcode?: string | null;
+    name: string;
+    unit_id?: number | null;
+    product_nature?: 'PRODUCT' | 'SUPPLY';
+    sale_price?: number;
+    cost_price?: number;
+    is_stockable?: boolean;
+    lot_tracking?: boolean;
+    has_expiration?: boolean;
+    status?: number;
+    initial_qty?: number;
+    initial_cost?: number;
+    warehouse_id?: number | null;
+    warehouse_code?: string | null;
+    stock_note?: string | null;
+  }
+): Promise<{ message: string; id: number }> {
+  return apiClient.request('/api/inventory/products', {
+    method: 'POST',
+    headers: authHeaders(accessToken),
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fetchInventoryStock(
+  accessToken: string,
+  context?: { warehouseId?: number | null }
+): Promise<InventoryStockRow[]> {
+  const query = new URLSearchParams();
+
+  if (context?.warehouseId) {
+    query.set('warehouse_id', String(context.warehouseId));
+  }
+
+  const suffix = query.toString();
+  const path = suffix ? `/api/inventory/current-stock?${suffix}` : '/api/inventory/current-stock';
+
+  const response = await apiClient.request<{ data: InventoryStockRow[] }>(path, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+
+  return response.data;
+}
+
+export async function fetchInventoryLots(
+  accessToken: string,
+  context?: { warehouseId?: number | null; productId?: number | null; onlyWithStock?: boolean }
+): Promise<InventoryLotRow[]> {
+  const query = new URLSearchParams();
+  query.set('only_with_stock', String(context?.onlyWithStock ?? true));
+
+  if (context?.warehouseId) {
+    query.set('warehouse_id', String(context.warehouseId));
+  }
+
+  if (context?.productId) {
+    query.set('product_id', String(context.productId));
+  }
+
+  const response = await apiClient.request<{ data: InventoryLotRow[] }>(`/api/inventory/lots?${query.toString()}`, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+
+  return response.data;
+}
+
+export type InventoryProductCommercialConfig = {
+  product: {
+    id: number;
+    name: string;
+    unit_id: number | null;
+    sale_price: number;
+  };
+  features?: {
+    PRODUCT_MULTI_UOM?: boolean;
+    PRODUCT_UOM_CONVERSIONS?: boolean;
+    PRODUCT_WHOLESALE_PRICING?: boolean;
+  };
+  product_units: Array<{
+    unit_id: number;
+    is_base: boolean;
+    status: number;
+    code: string;
+    name: string;
+  }>;
+  conversions: Array<{
+    from_unit_id: number;
+    to_unit_id: number;
+    conversion_factor: number;
+    status: number;
+  }>;
+  wholesale_prices: Array<{
+    unit_id: number | null;
+    min_qty: string;
+    max_qty: string | null;
+    unit_price: number;
+    status: number;
+  }>;
+};
+
+export async function fetchInventoryProductCommercialConfig(
+  accessToken: string,
+  productId: number,
+): Promise<InventoryProductCommercialConfig> {
+  return apiClient.request<InventoryProductCommercialConfig>(`/api/inventory/products/${productId}/commercial-config`, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+}
+
+export async function fetchKardex(
+  accessToken: string,
+  params?: {
+    productId?: number | null;
+    warehouseId?: number | null;
+    dateFrom?: string;
+    dateTo?: string;
+    page?: number;
+    perPage?: number;
+  }
+): Promise<{ data: KardexRow[]; meta: KardexMeta }> {
+  const query = new URLSearchParams();
+
+  if (params?.productId) {
+    query.set('product_id', String(params.productId));
+  }
+  if (params?.warehouseId) {
+    query.set('warehouse_id', String(params.warehouseId));
+  }
+  if (params?.dateFrom) {
+    query.set('date_from', params.dateFrom);
+  }
+  if (params?.dateTo) {
+    query.set('date_to', params.dateTo);
+  }
+  if (params?.page) {
+    query.set('page', String(params.page));
+  }
+  if (params?.perPage) {
+    query.set('per_page', String(params.perPage));
+  }
+
+  const path = query.toString() ? `/api/inventory/kardex?${query.toString()}` : '/api/inventory/kardex';
+
+  return apiClient.request<{ data: KardexRow[]; meta: KardexMeta }>(path, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+}
+
+export async function fetchInventoryProDashboard(
+  accessToken: string,
+  params?: {
+    days?: number;
+    warehouseId?: number | null;
+  }
+): Promise<InventoryProDashboardResponse> {
+  const query = new URLSearchParams();
+
+  if (params?.days && params.days > 0) {
+    query.set('days', String(params.days));
+  }
+  if (params?.warehouseId) {
+    query.set('warehouse_id', String(params.warehouseId));
+  }
+
+  const path = query.toString() ? `/api/inventory-pro/dashboard?${query.toString()}` : '/api/inventory-pro/dashboard';
+  return apiClient.request<InventoryProDashboardResponse>(path, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+}
+
+export async function fetchInventoryProDailySnapshot(
+  accessToken: string,
+  params?: {
+    dateFrom?: string;
+    dateTo?: string;
+    warehouseId?: number | null;
+    productId?: number | null;
+    limit?: number;
+  }
+): Promise<InventoryProDailySnapshotResponse> {
+  const query = new URLSearchParams();
+
+  if (params?.dateFrom) {
+    query.set('date_from', params.dateFrom);
+  }
+  if (params?.dateTo) {
+    query.set('date_to', params.dateTo);
+  }
+  if (params?.warehouseId) {
+    query.set('warehouse_id', String(params.warehouseId));
+  }
+  if (params?.productId) {
+    query.set('product_id', String(params.productId));
+  }
+  if (params?.limit && params.limit > 0) {
+    query.set('limit', String(params.limit));
+  }
+
+  const path = query.toString() ? `/api/inventory-pro/daily-snapshot?${query.toString()}` : '/api/inventory-pro/daily-snapshot';
+  return apiClient.request<InventoryProDailySnapshotResponse>(path, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+}
+
+export async function fetchInventoryProLotExpiry(
+  accessToken: string,
+  params?: {
+    warehouseId?: number | null;
+    productId?: number | null;
+    bucket?: string;
+    limit?: number;
+  }
+): Promise<InventoryProLotExpiryResponse> {
+  const query = new URLSearchParams();
+
+  if (params?.warehouseId) {
+    query.set('warehouse_id', String(params.warehouseId));
+  }
+  if (params?.productId) {
+    query.set('product_id', String(params.productId));
+  }
+  if (params?.bucket) {
+    query.set('bucket', params.bucket);
+  }
+  if (params?.limit && params.limit > 0) {
+    query.set('limit', String(params.limit));
+  }
+
+  const path = query.toString() ? `/api/inventory-pro/lot-expiry?${query.toString()}` : '/api/inventory-pro/lot-expiry';
+  return apiClient.request<InventoryProLotExpiryResponse>(path, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+}
+
+export async function fetchInventoryProReportRequests(
+  accessToken: string,
+  params?: {
+    status?: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+    reportCode?: ReportsApiReportCode;
+    limit?: number;
+  }
+): Promise<InventoryProReportRequestsResponse> {
+  const query = new URLSearchParams();
+
+  if (params?.status) {
+    query.set('status', params.status);
+  }
+  if (params?.reportCode) {
+    query.set('report_code', params.reportCode);
+  }
+  if (params?.limit && params.limit > 0) {
+    query.set('per_page', String(params.limit));
+  }
+
+  const path = query.toString() ? `/api/reports/requests?${query.toString()}` : '/api/reports/requests';
+  return apiClient.request<InventoryProReportRequestsResponse>(path, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+}
+
+export async function createInventoryProReportRequest(
+  accessToken: string,
+  payload: {
+    reportCode: ReportsApiReportCode;
+    filters?: Record<string, unknown>;
+    runAsync?: boolean;
+  }
+): Promise<InventoryProReportRequestCreateResponse> {
+  return apiClient.request<InventoryProReportRequestCreateResponse>('/api/reports/requests', {
+    method: 'POST',
+    headers: {
+      ...authHeaders(accessToken),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      report_code: payload.reportCode,
+      filters: payload.filters ?? {},
+      run_async: payload.runAsync ?? false,
+    }),
+  });
+}
+
+export async function fetchInventoryProReportRequest(
+  accessToken: string,
+  requestId: number
+): Promise<InventoryProReportRequestDetailResponse> {
+  const response = await apiClient.request<InventoryProReportRequestDetailResponse | { data: InventoryProReportRequestDetailResponse }>(`/api/reports/requests/${requestId}`, {
+    method: 'GET',
+    headers: authHeaders(accessToken),
+  });
+
+  if (response && typeof response === 'object' && 'data' in response && response.data) {
+    return response.data;
+  }
+
+  return response as InventoryProReportRequestDetailResponse;
+}
+
+export type InventoryBulkImportRow = {
+  id?: number;
+  sku?: string;
+  barcode?: string;
+  name?: string;
+  product_nature?: string;
+  sale_price?: number | string;
+  cost_price?: number | string;
+  unit_code?: string;
+  sunat_code?: string;
+  is_stockable?: boolean | number | string;
+  lot_tracking?: boolean | number | string;
+  has_expiration?: boolean | number | string;
+  status?: boolean | number | string;
+  initial_qty?: number | string;
+  initial_cost?: number | string;
+  warehouse_code?: string;
+};
+
+export type InventoryBulkImportResponse = {
+  message: string;
+  batch_id: number;
+  summary: {
+    total: number;
+    created: number;
+    updated: number;
+    skipped: number;
+    errors: number;
+    stock_applied?: number;
+    stock_skipped?: number;
+  };
+  errors: Array<{ row: number; message: string }>;
+};
+
+export type InventoryBulkStockUpdateMode = 'add' | 'replace';
+
+export type InventoryBulkStockUpdateRow = {
+  id?: number;
+  sku?: string;
+  qty: number | string;
+  warehouse_code?: string;
+  note?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type InventoryBulkStockUpdateResponse = {
+  message: string;
+  batch_id: number;
+  summary: {
+    total: number;
+    applied: number;
+    created_products?: number;
+    omitted: number;
+    errors: number;
+    ledger_rows?: number;
+    mode?: InventoryBulkStockUpdateMode | string;
+  };
+  errors: Array<{ row: number; message: string }>;
+};
+
+export type InventoryProductImportBatch = {
+  id: number;
+  company_id: number;
+  imported_by: number;
+  imported_by_name: string | null;
+  imported_by_username: string | null;
+  filename: string | null;
+  total_rows: number;
+  created_count: number;
+  updated_count: number;
+  skipped_count: number;
+  error_count: number;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  created_at: string;
+};
+
+export type InventoryProductImportBatchItem = {
+  id: number;
+  batch_id: number;
+  row_number: number;
+  action_status: 'CREATED' | 'UPDATED' | 'SKIPPED' | string;
+  product_id: number | null;
+  sku: string | null;
+  barcode: string | null;
+  name: string | null;
+  message: string | null;
+  created_at: string;
+};
+
+export type InventoryProductImportBatchDetail = {
+  batch: InventoryProductImportBatch;
+  items: InventoryProductImportBatchItem[];
+  errors: Array<{ row: number; message: string }>;
+};
+
+export async function importInventoryProductsBulk(
+  accessToken: string,
+  rows: InventoryBulkImportRow[],
+  filename?: string
+): Promise<InventoryBulkImportResponse> {
+  return apiClient.request<InventoryBulkImportResponse>('/api/inventory/products/bulk-import', {
+    method: 'POST',
+    headers: {
+      ...authHeaders(accessToken),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ rows, filename: filename ?? null }),
+  });
+}
+
+/**
+ * Import products in chunks to avoid timeout on large files.
+ * Sends batches of up to 500 rows, aggregating results across all batches.
+ */
+export async function importInventoryProductsBulkWithChunking(
+  accessToken: string,
+  rows: InventoryBulkImportRow[],
+  filename?: string,
+  chunkSize: number = 500
+): Promise<InventoryBulkImportResponse> {
+  if (rows.length <= chunkSize) {
+    return importInventoryProductsBulk(accessToken, rows, filename);
+  }
+
+  const chunks: InventoryBulkImportRow[][] = [];
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    chunks.push(rows.slice(i, i + chunkSize));
+  }
+
+  let totalCreated = 0;
+  let totalUpdated = 0;
+  let totalSkipped = 0;
+  let totalStockApplied = 0;
+  let totalStockSkipped = 0;
+  let allErrors: Array<{ row: number; message: string }> = [];
+  let lastBatchId = 0;
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const chunkFilename = filename ? `${filename} (parte ${i + 1}/${chunks.length})` : undefined;
+
+    const result = await importInventoryProductsBulk(accessToken, chunk, chunkFilename);
+
+    totalCreated += result.summary.created;
+    totalUpdated += result.summary.updated;
+    totalSkipped += result.summary.skipped;
+    totalStockApplied += result.summary.stock_applied ?? 0;
+    totalStockSkipped += result.summary.stock_skipped ?? 0;
+    allErrors = allErrors.concat(result.errors);
+    if (result.batch_id) {
+      lastBatchId = result.batch_id;
+    }
+
+    // Small delay between requests to avoid overwhelming the server
+    if (i < chunks.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  return {
+    message: 'Importación masiva procesada.',
+    summary: {
+      total: rows.length,
+      created: totalCreated,
+      updated: totalUpdated,
+      skipped: totalSkipped,
+      errors: allErrors.length,
+      stock_applied: totalStockApplied,
+      stock_skipped: totalStockSkipped,
+    },
+    errors: allErrors,
+    batch_id: lastBatchId,
+  };
+}
+
+export async function updateInventoryStockBulk(
+  accessToken: string,
+  rows: InventoryBulkStockUpdateRow[],
+  mode: InventoryBulkStockUpdateMode,
+  filename?: string,
+): Promise<InventoryBulkStockUpdateResponse> {
+  return apiClient.request<InventoryBulkStockUpdateResponse>('/api/inventory/products/bulk-stock-update', {
+    method: 'POST',
+    headers: {
+      ...authHeaders(accessToken),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ rows, mode, filename: filename ?? null }),
+  });
+}
+
+export async function updateInventoryStockBulkWithChunking(
+  accessToken: string,
+  rows: InventoryBulkStockUpdateRow[],
+  mode: InventoryBulkStockUpdateMode,
+  filename?: string,
+  chunkSize: number = 500
+): Promise<InventoryBulkStockUpdateResponse> {
+  if (rows.length <= chunkSize) {
+    return updateInventoryStockBulk(accessToken, rows, mode, filename);
+  }
+
+  const chunks: InventoryBulkStockUpdateRow[][] = [];
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    chunks.push(rows.slice(i, i + chunkSize));
+  }
+
+  let totalApplied = 0;
+  let totalOmitted = 0;
+  let totalLedgerRows = 0;
+  let allErrors: Array<{ row: number; message: string }> = [];
+  let lastBatchId = 0;
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    const chunk = chunks[i];
+    const chunkFilename = filename ? `${filename} (parte ${i + 1}/${chunks.length})` : undefined;
+    const result = await updateInventoryStockBulk(accessToken, chunk, mode, chunkFilename);
+
+    totalApplied += result.summary.applied;
+    totalOmitted += result.summary.omitted;
+    totalLedgerRows += result.summary.ledger_rows ?? 0;
+    allErrors = allErrors.concat(result.errors);
+    if (result.batch_id) {
+      lastBatchId = result.batch_id;
+    }
+
+    if (i < chunks.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  return {
+    message: 'Actualización masiva de stock procesada.',
+    batch_id: lastBatchId,
+    summary: {
+      total: rows.length,
+      applied: totalApplied,
+      omitted: totalOmitted,
+      errors: allErrors.length,
+      ledger_rows: totalLedgerRows,
+      mode,
+    },
+    errors: allErrors,
+  };
+}
+
+export async function fetchInventoryProductImportBatches(
+  accessToken: string,
+  limit = 30
+): Promise<InventoryProductImportBatch[]> {
+  const query = new URLSearchParams();
+  query.set('limit', String(limit));
+
+  const response = await apiClient.request<{ data: InventoryProductImportBatch[] }>(
+    `/api/inventory/products/import-batches?${query.toString()}`,
+    {
+      method: 'GET',
+      headers: authHeaders(accessToken),
+    }
+  );
+
+  return response.data;
+}
+
+export async function fetchInventoryProductImportBatchDetail(
+  accessToken: string,
+  batchId: number,
+  itemsLimit = 500
+): Promise<InventoryProductImportBatchDetail> {
+  const query = new URLSearchParams();
+  query.set('items_limit', String(itemsLimit));
+
+  return apiClient.request<InventoryProductImportBatchDetail>(
+    `/api/inventory/products/import-batches/${batchId}?${query.toString()}`,
+    {
+      method: 'GET',
+      headers: authHeaders(accessToken),
+    }
+  );
+}
+
+export type CreateInventoryStockEntryPayload = {
+  warehouse_id: number;
+  entry_type: 'PURCHASE' | 'ADJUSTMENT' | 'PURCHASE_ORDER';
+  issue_at?: string;
+  notes?: string;
+  items: Array<{
+    product_id: number;
+    qty: number;
+    unit_cost?: number;
+    lot_id?: number;
+    lot_code?: string;
+    expiry_date?: string;
+  }>;
+};
+
+export async function createInventoryStockEntry(
+  accessToken: string,
+  payload: CreateInventoryStockEntryPayload,
+): Promise<{ message: string; data: { id: number } }> {
+  return apiClient.request<{ message: string; data: { id: number } }>('/api/inventory/stock-entries', {
+    method: 'POST',
+    headers: {
+      ...authHeaders(accessToken),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+}

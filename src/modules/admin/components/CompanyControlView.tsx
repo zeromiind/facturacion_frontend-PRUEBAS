@@ -1,0 +1,3246 @@
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  createAdminCompany,
+  downloadSystemDatabaseBackup,
+  downloadSystemDatabaseBackupFile,
+  listSystemDatabaseBackups,
+  restoreSystemDatabaseBackup,
+  fetchCompanyCommerceAdminMatrix,
+  fetchCompanyInventorySettingsAdminMatrix,
+  fetchCompanyOperationalLimitMatrix,
+  fetchCompanyRateLimitMatrix,
+  fetchGlobalSubscriptionSchedule,
+  fetchCompanySunatReconcileAdminMatrix,
+  fetchCompanyVerticalAdminMatrix,
+  resetAdminCompanyPassword,
+  revealAdminCompanyPassword,
+  updateCompanyCommerceAdminMatrix,
+  updateCompanyInventorySettingsAdminMatrix,
+  updateCompanyOperationalLimitMatrix,
+  updateCompanyOperationalLimitMatrixBulk,
+  updateCompanyRateLimitMatrix,
+  updateCompanyRateLimitMatrixBulk,
+  updateGlobalSubscriptionSchedule,
+  updateCompanySubscriptionAdminMatrix,
+  updateCompanySunatReconcileAdminMatrix,
+  updateCompanyVerticalAdminMatrix,
+  updateCompanyVerticalAdminMatrixBulk,
+} from '../../appcfg/api';
+import type {
+  CompanyCommerceAdminMatrixResponse,
+  CompanyInventorySettingsAdminMatrixResponse,
+  CompanySubscriptionSummary,
+  InventorySettingsRecord,
+  CompanyOperationalLimitMatrixResponse,
+  CompanyRateLimitMatrixResponse,
+  CompanySunatReconcileAdminMatrixResponse,
+  CompanySunatReconcileAdminRecord,
+  CompanyVerticalAdminMatrixResponse,
+  GlobalSubscriptionScheduleResponse,
+} from '../../appcfg/types';
+
+const ADMIN_COMMERCE_FEATURE_BASELINE = [
+  'SALES_ALLOW_RECEIPT_WITH_RUC',
+];
+
+function buildCommerceFeatureCodes(matrix: CompanyCommerceAdminMatrixResponse | null): string[] {
+  const apiCodes = matrix?.feature_codes ?? [];
+  const companyCodes = new Set<string>();
+  for (const company of matrix?.companies ?? []) {
+    for (const code of Object.keys(company.features ?? {})) {
+      companyCodes.add(code);
+    }
+  }
+
+  const merged = new Set<string>([
+    ...ADMIN_COMMERCE_FEATURE_BASELINE,
+    ...apiCodes,
+    ...Array.from(companyCodes),
+  ]);
+
+  return Array.from(merged).sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeCompanyFeatures(codes: string[], companyFeatures: Record<string, boolean> | undefined): Record<string, boolean> {
+  const normalized: Record<string, boolean> = {};
+  for (const code of codes) {
+    normalized[code] = Boolean(companyFeatures?.[code]);
+  }
+  return normalized;
+}
+
+function featureLabel(code: string, labelsByCode: Record<string, string>): string {
+  const apiLabel = (labelsByCode[code] ?? '').trim();
+  if (apiLabel !== '' && apiLabel.toUpperCase() !== code.toUpperCase()) {
+    return apiLabel;
+  }
+
+  return code.replace(/_+/g, ' ').trim().toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function buildSuggestedAdminUsername(taxId: string, legalName: string): string {
+  const cleanTaxId = (taxId || '').replace(/\D+/g, '');
+  if (cleanTaxId.length >= 6) {
+    return `admin_${cleanTaxId}`;
+  }
+
+  const slugBase = (legalName || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 18);
+
+  return slugBase ? `admin_${slugBase}` : 'admin_empresa';
+}
+
+function formatLastIssuedAtLabel(value: string | null | undefined): string {
+  const raw = String(value ?? '').trim();
+  if (raw === '') {
+    return 'Sin emision';
+  }
+
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) {
+    return 'Sin emision';
+  }
+
+  return new Intl.DateTimeFormat('es-PE', {
+    dateStyle: 'short',
+    timeStyle: 'short',
+    timeZone: 'America/Lima',
+  }).format(date);
+}
+
+function formatLastIssuedAgoLabel(value: string | null | undefined): string {
+  const raw = String(value ?? '').trim();
+  if (raw === '') {
+    return '';
+  }
+
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+
+  const diffMs = Date.now() - date.getTime();
+  if (diffMs < 0) {
+    return 'hace instantes';
+  }
+
+  const minuteMs = 60 * 1000;
+  const hourMs = 60 * minuteMs;
+  const dayMs = 24 * hourMs;
+
+  if (diffMs < hourMs) {
+    const minutes = Math.max(1, Math.floor(diffMs / minuteMs));
+    return `hace ${minutes} min`;
+  }
+
+  if (diffMs < dayMs) {
+    const hours = Math.max(1, Math.floor(diffMs / hourMs));
+    return `hace ${hours} h`;
+  }
+
+  const days = Math.max(1, Math.floor(diffMs / dayMs));
+  return `hace ${days} dia${days === 1 ? '' : 's'}`;
+}
+
+function cloneSubscriptionDraft(subscription: CompanySubscriptionSummary): CompanySubscriptionSummary {
+  return { ...subscription };
+}
+
+function subscriptionStateLabel(subscription: CompanySubscriptionSummary): string {
+  switch (subscription.alert_state) {
+    case 'OK':
+      return 'Vigente';
+    case 'UPCOMING':
+      return `Vence en ${subscription.days_until_due ?? subscription.reminder_days_before}d`;
+    case 'DUE_TODAY':
+      return 'Vence hoy';
+    case 'GRACE':
+      return `En gracia ${subscription.days_overdue ?? 0}d`;
+    case 'OVERDUE':
+      return `Vencida ${subscription.days_overdue ?? 0}d`;
+    case 'SOFT_BLOCK':
+      return 'Escalar parcial';
+    case 'HARD_BLOCK':
+      return 'Escalar fuerte';
+    case 'PAUSED':
+      return 'Pausada';
+    case 'CANCELED':
+      return 'Cancelada';
+    default:
+      return 'Sin configurar';
+  }
+}
+
+function subscriptionBadgeClass(alertState: CompanySubscriptionSummary['alert_state']): string {
+  switch (alertState) {
+    case 'OK':
+      return 'adm-badge-ok';
+    case 'UPCOMING':
+    case 'DUE_TODAY':
+      return 'adm-badge-blue';
+    case 'GRACE':
+    case 'SOFT_BLOCK':
+      return 'adm-badge-warn';
+    case 'OVERDUE':
+    case 'HARD_BLOCK':
+      return 'adm-badge-off';
+    default:
+      return 'adm-badge-neutral';
+  }
+}
+
+function formatSubscriptionDueText(subscription: CompanySubscriptionSummary): string {
+  if (!subscription.current_period_ends_at) {
+    return 'Sin fecha';
+  }
+
+  return `Vence ${subscription.current_period_ends_at}`;
+}
+
+type Props = { accessToken: string; onUnauthorized?: () => void };
+
+type AdminPanelKey = 'companies' | 'operational' | 'rate' | 'commerce' | 'sunat' | 'inventory';
+
+type ResetPreview = {
+  companyName: string;
+  username: string;
+  email: string | null;
+  newPassword: string;
+  generatedAtLabel: string;
+};
+
+type BackupHistoryRow = {
+  file_name: string;
+  size_bytes: number;
+  size_label: string;
+  generated_at: string;
+};
+
+type CompanySortKey =
+  | 'legal_name'
+  | 'tax_id'
+  | 'active_vertical_name'
+  | 'company_status'
+  | 'issued_documents_count'
+  | 'issued_last_at'
+  | 'admin_username';
+
+type CompanySortState = {
+  key: CompanySortKey;
+  direction: 'asc' | 'desc';
+};
+
+type CompanySubscriptionDraftMap = Record<number, CompanySubscriptionSummary>;
+
+function compareCompanyText(a: string | null | undefined, b: string | null | undefined): number {
+  return String(a ?? '').trim().localeCompare(String(b ?? '').trim(), 'es', {
+    sensitivity: 'base',
+    numeric: true,
+  });
+}
+
+function compareCompanyDate(a: string | null | undefined, b: string | null | undefined): number {
+  const aTime = a ? new Date(a).getTime() : Number.NaN;
+  const bTime = b ? new Date(b).getTime() : Number.NaN;
+  const aMissing = Number.isNaN(aTime);
+  const bMissing = Number.isNaN(bTime);
+
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1;
+  if (bMissing) return -1;
+
+  return aTime - bTime;
+}
+
+export function CompanyControlView({ accessToken, onUnauthorized }: Props) {
+  const PAGE_SIZE = 12;
+  const BACKUP_PAGE_SIZE = 10;
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState('');
+  const [activePanel, setActivePanel] = useState<AdminPanelKey>('companies');
+
+  function handleApiError(err: unknown, fallback: string): string {
+    const msg = err instanceof Error ? err.message : fallback;
+    if (msg.toLowerCase().includes('expirada') || msg.toLowerCase().includes('invalida')) {
+      onUnauthorized?.();
+    }
+    return msg;
+  }
+  const [isError, setIsError] = useState(false);
+  const [matrix, setMatrix]   = useState<CompanyVerticalAdminMatrixResponse | null>(null);
+  const [rateMatrix, setRateMatrix] = useState<CompanyRateLimitMatrixResponse | null>(null);
+  const [operationalMatrix, setOperationalMatrix] = useState<CompanyOperationalLimitMatrixResponse | null>(null);
+  const [globalSubscriptionSchedule, setGlobalSubscriptionSchedule] = useState<GlobalSubscriptionScheduleResponse | null>(null);
+  const [sunatMatrix, setSunatMatrix] = useState<CompanySunatReconcileAdminMatrixResponse | null>(null);
+  const [selectedVerticalByCompany, setSelectedVerticalByCompany] = useState<Record<number, string>>({});
+  const [rateDraftByCompany, setRateDraftByCompany] = useState<Record<number, {
+    is_enabled: boolean;
+    requests_per_minute_read: number;
+    requests_per_minute_write: number;
+    requests_per_minute_reports: number;
+    response_delay_enabled: boolean;
+    response_delay_ms: number;
+    plan_code: 'BASIC' | 'PRO' | 'ENTERPRISE' | 'CUSTOM';
+  }>>({});
+  const [searchText, setSearchText]               = useState('');
+  const [filterVerticalCode, setFilterVerticalCode] = useState('');
+  const [bulkVerticalCode, setBulkVerticalCode]     = useState('');
+  const [bulkRateRead, setBulkRateRead] = useState(3600);
+  const [bulkRateWrite, setBulkRateWrite] = useState(2400);
+  const [bulkRateReports, setBulkRateReports] = useState(900);
+  const [bulkPresetCode, setBulkPresetCode] = useState<'BASIC' | 'PRO' | 'ENTERPRISE'>('PRO');
+  const [opDraftByCompany, setOpDraftByCompany] = useState<Record<number, {
+    max_branches_enabled: number;
+    max_warehouses_enabled: number;
+    max_cash_registers_enabled: number;
+    max_cash_registers_per_warehouse: number;
+  }>>({});
+  const [bulkOpBranches, setBulkOpBranches] = useState(1);
+  const [bulkOpWarehouses, setBulkOpWarehouses] = useState(1);
+  const [bulkOpCash, setBulkOpCash] = useState(1);
+  const [bulkOpCashPerWarehouse, setBulkOpCashPerWarehouse] = useState(1);
+  const [subscriptionFrequency, setSubscriptionFrequency] = useState<'DAILY' | 'WEEKLY' | 'MONTHLY'>('WEEKLY');
+  const [subscriptionAlertTime, setSubscriptionAlertTime] = useState('08:00');
+  const [subscriptionWeeklyDigestDay, setSubscriptionWeeklyDigestDay] = useState(1);
+  const [subscriptionMonthlyDigestDay, setSubscriptionMonthlyDigestDay] = useState(1);
+  const [commerceMatrix, setCommerceMatrix] = useState<CompanyCommerceAdminMatrixResponse | null>(null);
+  const [inventoryMatrix, setInventoryMatrix] = useState<CompanyInventorySettingsAdminMatrixResponse | null>(null);
+  const [commerceDraftByCompany, setCommerceDraftByCompany] = useState<Record<number, Record<string, boolean>>>({});
+  const [sunatDraftByCompany, setSunatDraftByCompany] = useState<Record<number, { tax_bridge_enabled: boolean; settings: CompanySunatReconcileAdminRecord }>>({});
+  const [inventoryDraftByCompany, setInventoryDraftByCompany] = useState<Record<number, InventorySettingsRecord>>({});
+  const [selectedCommerceCompanyId, setSelectedCommerceCompanyId] = useState<number | null>(null);
+  const [commerceCompanyQuery, setCommerceCompanyQuery] = useState('');
+  const [commerceCompanyDropdownOpen, setCommerceCompanyDropdownOpen] = useState(false);
+  const [createDraft, setCreateDraft] = useState({
+    tax_id: '',
+    legal_name: '',
+    trade_name: '',
+    email: '',
+    phone: '',
+    address: '',
+    vertical_code: '',
+    admin_username: '',
+    admin_password: '',
+    admin_first_name: '',
+    admin_last_name: '',
+    admin_email: '',
+    admin_phone: '',
+    main_branch_code: '001',
+    main_branch_name: 'Sucursal Principal',
+    create_default_warehouse: true,
+    default_warehouse_code: 'ALM-001',
+    default_warehouse_name: 'Almacen Principal',
+    create_default_cash_register: true,
+    default_cash_register_code: 'CAJA-001',
+    default_cash_register_name: 'Caja Principal',
+    plan_code: 'PRO' as 'BASIC' | 'PRO' | 'ENTERPRISE' | 'CUSTOM',
+    preset_code: 'PRO' as 'BASIC' | 'PRO' | 'ENTERPRISE',
+  });
+
+  const [createStep, setCreateStep] = useState<1 | 2 | 3>(1);
+  const [resetModal, setResetModal] = useState<ResetPreview | null>(null);
+  const [detailCompanyId, setDetailCompanyId] = useState<number | null>(null);
+  const [detailTab, setDetailTab] = useState<'general' | 'access' | 'security' | 'history'>('general');
+  const [detailDrawerOpen, setDetailDrawerOpen] = useState(false);
+  const [resetPreviewByCompany, setResetPreviewByCompany] = useState<Record<number, ResetPreview>>({});
+  const [revealedPasswordByCompany, setRevealedPasswordByCompany] = useState<Record<number, { username: string; password: string } | null>>({});
+  const [revealLoading, setRevealLoading] = useState(false);
+  const [showResetPassword, setShowResetPassword] = useState(false);
+  const [resetPasswordCopied, setResetPasswordCopied] = useState(false);
+  const [adminUsernameTouched, setAdminUsernameTouched] = useState(false);
+  const [debouncedSearchText, setDebouncedSearchText] = useState('');
+  const [currentCompanyPage, setCurrentCompanyPage] = useState(1);
+  const [companySort, setCompanySort] = useState<CompanySortState>({ key: 'legal_name', direction: 'asc' });
+  const [subscriptionDraftByCompany, setSubscriptionDraftByCompany] = useState<CompanySubscriptionDraftMap>({});
+  const [backupRows, setBackupRows] = useState<BackupHistoryRow[]>([]);
+  const [backupHistoryLoading, setBackupHistoryLoading] = useState(false);
+  const [selectedBackupCompanyId, setSelectedBackupCompanyId] = useState<number | null>(null);
+  const [backupCompanyQuery, setBackupCompanyQuery] = useState('');
+  const [backupCompanyDropdownOpen, setBackupCompanyDropdownOpen] = useState(false);
+  const [restoreBackupFile, setRestoreBackupFile] = useState<File | null>(null);
+  const [restoreInputKey, setRestoreInputKey] = useState(0);
+  const [backupHistoryPage, setBackupHistoryPage] = useState(1);
+  const [backupHistoryTotal, setBackupHistoryTotal] = useState(0);
+  const [backupHistoryLastPage, setBackupHistoryLastPage] = useState(1);
+  const extendedMatricesInFlightRef = useRef<Promise<void> | null>(null);
+
+  useEffect(() => {
+    if (adminUsernameTouched) return;
+    const suggested = buildSuggestedAdminUsername(createDraft.tax_id, createDraft.legal_name);
+    setCreateDraft(prev => {
+      if (prev.admin_username === suggested) return prev;
+      return { ...prev, admin_username: suggested };
+    });
+  }, [adminUsernameTouched, createDraft.tax_id, createDraft.legal_name]);
+
+  async function doRevealAdminPassword(companyId: number) {
+    setRevealLoading(true);
+    try {
+      const result = await revealAdminCompanyPassword(accessToken, companyId);
+      if (result.available) {
+        setRevealedPasswordByCompany((prev) => ({
+          ...prev,
+          [companyId]: { username: result.username, password: result.password },
+        }));
+      } else {
+        setMessage(result.message);
+        setIsError(false);
+      }
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo obtener la contraseña');
+      setIsError(true);
+    } finally { setRevealLoading(false); }
+  }
+
+  async function doResetAdminPassword(companyId: number, companyName: string) {
+    if (!confirm(`¿Resetear la contraseña del administrador de "${companyName}"? Se generará una nueva contraseña temporal.`)) return;
+    setLoading(true); setMessage(''); setIsError(false);
+    try {
+      const result = await resetAdminCompanyPassword(accessToken, companyId);
+      const generatedAtLabel = new Intl.DateTimeFormat('es-PE', {
+        dateStyle: 'short',
+        timeStyle: 'short',
+        timeZone: 'America/Lima',
+      }).format(new Date());
+      const preview: ResetPreview = {
+        companyName,
+        username: result.username,
+        email: result.email,
+        newPassword: result.new_password,
+        generatedAtLabel,
+      };
+      setResetPreviewByCompany((prev) => ({
+        ...prev,
+        [companyId]: preview,
+      }));
+      setShowResetPassword(false);
+      setResetPasswordCopied(false);
+      setResetModal(preview);
+      setMessage(`Nueva clave temporal generada para ${companyName}.`);
+      setIsError(false);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo resetear la contraseña');
+      setIsError(true);
+    } finally { setLoading(false); }
+  }
+
+  async function copyResetCredentials(preview: ResetPreview) {
+    try {
+      await navigator.clipboard.writeText(`Empresa: ${preview.companyName}\nUsuario: ${preview.username}\nClave temporal: ${preview.newPassword}`);
+      setResetPasswordCopied(true);
+    } catch {
+      setMessage('No se pudo copiar la credencial.');
+      setIsError(true);
+    }
+  }
+
+  async function loadExtendedMatrices() {
+    const [rateResult, operationalResult, globalScheduleResult, commerceResult, sunatResult, inventoryResult] = await Promise.all([
+      fetchCompanyRateLimitMatrix(accessToken),
+      fetchCompanyOperationalLimitMatrix(accessToken),
+      fetchGlobalSubscriptionSchedule(accessToken),
+      fetchCompanyCommerceAdminMatrix(accessToken),
+      fetchCompanySunatReconcileAdminMatrix(accessToken),
+      fetchCompanyInventorySettingsAdminMatrix(accessToken),
+    ]);
+
+    setRateMatrix(rateResult);
+    setOperationalMatrix(operationalResult);
+    setGlobalSubscriptionSchedule(globalScheduleResult);
+    setCommerceMatrix(commerceResult);
+    setSunatMatrix(sunatResult);
+    setInventoryMatrix(inventoryResult);
+
+    const allCommerceCodes = buildCommerceFeatureCodes(commerceResult);
+    const nextCommerceDraft: Record<number, Record<string, boolean>> = {};
+    for (const company of commerceResult.companies) {
+      nextCommerceDraft[company.company_id] = normalizeCompanyFeatures(allCommerceCodes, company.features);
+    }
+    setCommerceDraftByCompany(nextCommerceDraft);
+
+    const nextSunatDraft: Record<number, { tax_bridge_enabled: boolean; settings: CompanySunatReconcileAdminRecord }> = {};
+    for (const company of sunatResult.companies) {
+      nextSunatDraft[company.company_id] = {
+        tax_bridge_enabled: company.tax_bridge_enabled,
+        settings: { ...company.sunat_reconcile },
+      };
+    }
+    setSunatDraftByCompany(nextSunatDraft);
+
+    setSelectedCommerceCompanyId(prev => {
+      if (prev !== null) return prev;
+      const first = commerceResult.companies[0];
+      if (first) {
+        setCommerceCompanyQuery(first.legal_name + (first.tax_id ? ` (${first.tax_id})` : ''));
+      }
+      return first?.company_id ?? null;
+    });
+
+    const nextInventoryDraft: Record<number, InventorySettingsRecord> = {};
+    for (const company of inventoryResult.companies) {
+      nextInventoryDraft[company.company_id] = { ...company.inventory_settings };
+    }
+    setInventoryDraftByCompany(nextInventoryDraft);
+
+    const nextRateDraft: Record<number, {
+      is_enabled: boolean;
+      requests_per_minute_read: number;
+      requests_per_minute_write: number;
+      requests_per_minute_reports: number;
+      response_delay_enabled: boolean;
+      response_delay_ms: number;
+      plan_code: 'BASIC' | 'PRO' | 'ENTERPRISE' | 'CUSTOM';
+    }> = {};
+    for (const company of rateResult.companies) {
+      nextRateDraft[company.company_id] = {
+        is_enabled: company.is_enabled,
+        requests_per_minute_read: company.requests_per_minute_read,
+        requests_per_minute_write: company.requests_per_minute_write,
+        requests_per_minute_reports: company.requests_per_minute_reports,
+        response_delay_enabled: company.response_delay_enabled,
+        response_delay_ms: company.response_delay_ms,
+        plan_code: company.plan_code,
+      };
+    }
+    setRateDraftByCompany(nextRateDraft);
+
+    const nextOpDraft: Record<number, {
+      max_branches_enabled: number;
+      max_warehouses_enabled: number;
+      max_cash_registers_enabled: number;
+      max_cash_registers_per_warehouse: number;
+    }> = {};
+    for (const company of operationalResult.companies) {
+      nextOpDraft[company.company_id] = {
+        max_branches_enabled: company.max_branches_enabled,
+        max_warehouses_enabled: company.max_warehouses_enabled,
+        max_cash_registers_enabled: company.max_cash_registers_enabled,
+        max_cash_registers_per_warehouse: company.max_cash_registers_per_warehouse,
+      };
+    }
+    setOpDraftByCompany(nextOpDraft);
+
+    setBulkRateRead(rateResult.defaults.requests_per_minute_read);
+    setBulkRateWrite(rateResult.defaults.requests_per_minute_write);
+    setBulkRateReports(rateResult.defaults.requests_per_minute_reports);
+    setBulkPresetCode('PRO');
+    setBulkOpBranches(operationalResult.defaults.max_branches_enabled);
+    setBulkOpWarehouses(operationalResult.defaults.max_warehouses_enabled);
+    setBulkOpCash(operationalResult.defaults.max_cash_registers_enabled);
+    setBulkOpCashPerWarehouse(operationalResult.defaults.max_cash_registers_per_warehouse);
+
+    const schedule = globalScheduleResult.schedule;
+    setSubscriptionFrequency(schedule.company_subscription_alert_frequency ?? 'WEEKLY');
+    setSubscriptionAlertTime(schedule.company_subscription_alert_time ?? '08:00');
+    setSubscriptionWeeklyDigestDay(schedule.company_subscription_weekly_digest_day ?? 1);
+    setSubscriptionMonthlyDigestDay(schedule.company_subscription_monthly_digest_day ?? 1);
+  }
+
+  async function ensureExtendedMatricesLoaded(force = false): Promise<void> {
+    const alreadyLoaded = Boolean(rateMatrix && operationalMatrix && commerceMatrix && sunatMatrix && inventoryMatrix);
+    if (!force && alreadyLoaded) {
+      return;
+    }
+
+    if (!force && extendedMatricesInFlightRef.current) {
+      await extendedMatricesInFlightRef.current;
+      return;
+    }
+
+    const request = (async () => {
+      await loadExtendedMatrices();
+    })();
+
+    extendedMatricesInFlightRef.current = request;
+
+    try {
+      await request;
+    } finally {
+      if (extendedMatricesInFlightRef.current === request) {
+        extendedMatricesInFlightRef.current = null;
+      }
+    }
+  }
+
+  async function loadMatrix(manageLoading = true) {
+    if (manageLoading) {
+      setLoading(true);
+      setMessage('');
+      setIsError(false);
+    }
+    try {
+      const verticalResult = await fetchCompanyVerticalAdminMatrix(accessToken);
+
+      setMatrix(verticalResult);
+
+      const nextMap: Record<number, string> = {};
+      const nextSubscriptionDrafts: CompanySubscriptionDraftMap = {};
+      for (const company of verticalResult.companies) {
+        nextMap[company.company_id] = company.active_vertical_code ?? verticalResult.verticals[0]?.code ?? '';
+        nextSubscriptionDrafts[company.company_id] = cloneSubscriptionDraft(company.subscription);
+      }
+      setSelectedVerticalByCompany(nextMap);
+      setSubscriptionDraftByCompany(nextSubscriptionDrafts);
+
+      setBulkVerticalCode(prev => prev || verticalResult.verticals[0]?.code || '');
+
+      setSelectedBackupCompanyId((prev) => {
+        if (prev !== null && verticalResult.companies.some((company) => company.company_id === prev)) {
+          return prev;
+        }
+        return verticalResult.companies[0]?.company_id ?? null;
+      });
+    } catch (err) {
+      setMessage(handleApiError(err, 'No se pudo cargar el control de empresas'));
+      setIsError(true);
+      setMatrix(null);
+    } finally {
+      if (manageLoading) {
+        setLoading(false);
+      }
+    }
+  }
+
+  useEffect(() => { void loadMatrix(); }, [accessToken]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (activePanel === 'companies') {
+      return;
+    }
+
+    const needsExtendedData =
+      (activePanel === 'rate' && !rateMatrix)
+      || (activePanel === 'operational' && !operationalMatrix)
+      || (activePanel === 'commerce' && !commerceMatrix)
+      || (activePanel === 'sunat' && !sunatMatrix)
+      || (activePanel === 'inventory' && !inventoryMatrix);
+
+    if (!needsExtendedData) {
+      return;
+    }
+
+    const run = async () => {
+      setLoading(true);
+      setMessage('');
+      setIsError(false);
+      try {
+        await ensureExtendedMatricesLoaded();
+      } catch (err) {
+        setMessage(handleApiError(err, 'No se pudo cargar la configuración avanzada del panel.'));
+        setIsError(true);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    void run();
+  }, [activePanel, accessToken, rateMatrix, operationalMatrix, commerceMatrix, sunatMatrix, inventoryMatrix]);
+
+  async function refreshAllPanels() {
+    setLoading(true);
+    setMessage('');
+    setIsError(false);
+    try {
+      await Promise.all([
+        loadMatrix(false),
+        ensureExtendedMatricesLoaded(true),
+      ]);
+    } catch (err) {
+      setMessage(handleApiError(err, 'No se pudo refrescar el panel administrativo completo.'));
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (activePanel !== 'companies') {
+      return;
+    }
+
+    if (selectedBackupCompanyId === null) {
+      setBackupRows([]);
+      setBackupHistoryTotal(0);
+      setBackupHistoryLastPage(1);
+      return;
+    }
+    void refreshBackupHistory(backupHistoryPage);
+  }, [accessToken, activePanel, selectedBackupCompanyId, backupHistoryPage]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (selectedBackupCompanyId === null) {
+      setBackupCompanyQuery('');
+      return;
+    }
+
+    const company = (matrix?.companies ?? []).find((row) => row.company_id === selectedBackupCompanyId);
+    if (!company) {
+      return;
+    }
+
+    setBackupCompanyQuery(company.legal_name + (company.tax_id ? ` (${company.tax_id})` : ''));
+  }, [selectedBackupCompanyId, matrix?.companies]);
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      setDebouncedSearchText(searchText);
+    }, 220);
+    return () => window.clearTimeout(timeoutId);
+  }, [searchText]);
+
+  const allCommerceFeatureCodes = useMemo(
+    () => buildCommerceFeatureCodes(commerceMatrix),
+    [commerceMatrix]
+  );
+  const commerceFeatureLabelsByCode = useMemo(
+    () => commerceMatrix?.feature_labels ?? {},
+    [commerceMatrix]
+  );
+
+  async function saveCommerceOne(companyId: number) {
+    const draft = commerceDraftByCompany[companyId];
+    if (!draft) return;
+    setLoading(true); setMessage(''); setIsError(false);
+    try {
+      const result = await updateCompanyCommerceAdminMatrix(accessToken, companyId, draft);
+      setCommerceMatrix(result);
+      const codes = buildCommerceFeatureCodes(result);
+      const updatedCompany = result.companies.find(c => c.company_id === companyId);
+      setCommerceDraftByCompany(prev => ({
+        ...prev,
+        [companyId]: normalizeCompanyFeatures(codes, updatedCompany?.features),
+      }));
+      setMessage('Reglas de ventas/compras actualizadas');
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Error al guardar');
+      setIsError(true);
+    } finally { setLoading(false); }
+  }
+
+  async function saveSunatOne(companyId: number) {
+    const draft = sunatDraftByCompany[companyId];
+    if (!draft) {
+      setMessage('No se encontro configuracion SUNAT para guardar.');
+      setIsError(true);
+      return;
+    }
+
+    setLoading(true); setMessage(''); setIsError(false);
+    try {
+      const result = await updateCompanySunatReconcileAdminMatrix(accessToken, {
+        company_id: companyId,
+        tax_bridge_enabled: draft.tax_bridge_enabled,
+        auto_reconcile_enabled: draft.settings.auto_reconcile_enabled,
+        reconcile_batch_size: draft.settings.reconcile_batch_size,
+        reconcile_retry_base_minutes: draft.settings.reconcile_retry_base_minutes,
+        reconcile_retry_max_minutes: draft.settings.reconcile_retry_max_minutes,
+        reconcile_warn_attempts: draft.settings.reconcile_warn_attempts,
+        sunat_exception_notify_enabled: draft.settings.sunat_exception_notify_enabled,
+        sunat_exception_notify_hours: draft.settings.sunat_exception_notify_hours,
+        sunat_alert_repeat_minutes: draft.settings.sunat_alert_repeat_minutes,
+        sunat_exception_notify_limit: draft.settings.sunat_exception_notify_limit,
+      });
+
+      setSunatMatrix(result);
+      const nextSunatDraft: Record<number, { tax_bridge_enabled: boolean; settings: CompanySunatReconcileAdminRecord }> = {};
+      for (const company of result.companies) {
+        nextSunatDraft[company.company_id] = {
+          tax_bridge_enabled: company.tax_bridge_enabled,
+          settings: { ...company.sunat_reconcile },
+        };
+      }
+      setSunatDraftByCompany(nextSunatDraft);
+      setMessage('Configuracion SUNAT por empresa actualizada.');
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo guardar configuracion SUNAT');
+      setIsError(true);
+    } finally { setLoading(false); }
+  }
+
+  async function saveInventoryOne(companyId: number) {
+    const draft = inventoryDraftByCompany[companyId];
+    if (!draft) return;
+    setLoading(true); setMessage(''); setIsError(false);
+    try {
+      const result = await updateCompanyInventorySettingsAdminMatrix(accessToken, companyId, draft);
+      setInventoryMatrix(result);
+      setMessage('Configuración de inventario actualizada');
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Error al guardar');
+      setIsError(true);
+    } finally { setLoading(false); }
+  }
+
+  const filteredCompanies = useMemo(() => {
+    return (matrix?.companies ?? []).filter(company => {
+      const search = debouncedSearchText.trim().toLowerCase();
+      const bySearch =
+        search === '' ||
+        company.legal_name.toLowerCase().includes(search) ||
+        (company.trade_name ?? '').toLowerCase().includes(search) ||
+        (company.tax_id ?? '').toLowerCase().includes(search);
+      const byVertical =
+        filterVerticalCode === '' ||
+        company.active_vertical_code === filterVerticalCode ||
+        company.assignments.some(a => a.vertical_code === filterVerticalCode && a.is_enabled);
+      return bySearch && byVertical;
+    });
+  }, [matrix?.companies, debouncedSearchText, filterVerticalCode]);
+
+  const sortedCompanies = useMemo(() => {
+    const directionFactor = companySort.direction === 'asc' ? 1 : -1;
+    return [...filteredCompanies].sort((left, right) => {
+      let result = 0;
+
+      switch (companySort.key) {
+        case 'legal_name':
+          result = compareCompanyText(left.legal_name, right.legal_name);
+          break;
+        case 'tax_id':
+          result = compareCompanyText(left.tax_id, right.tax_id);
+          break;
+        case 'active_vertical_name':
+          result = compareCompanyText(left.active_vertical_name, right.active_vertical_name);
+          break;
+        case 'company_status':
+          result = left.company_status - right.company_status;
+          break;
+        case 'issued_documents_count':
+          result = left.issued_documents_count - right.issued_documents_count;
+          break;
+        case 'issued_last_at':
+          result = compareCompanyDate(left.issued_last_at, right.issued_last_at);
+          break;
+        case 'admin_username':
+          result = compareCompanyText(left.admin_username, right.admin_username);
+          break;
+      }
+
+      if (result === 0) {
+        result = compareCompanyText(left.legal_name, right.legal_name);
+      }
+
+      if (result === 0) {
+        result = left.company_id - right.company_id;
+      }
+
+      return result * directionFactor;
+    });
+  }, [filteredCompanies, companySort]);
+
+  useEffect(() => {
+    setCurrentCompanyPage(1);
+  }, [debouncedSearchText, filterVerticalCode, companySort]);
+
+  function handleCompanySort(key: CompanySortKey) {
+    setCompanySort((prev) => {
+      if (prev.key === key) {
+        return { key, direction: prev.direction === 'asc' ? 'desc' : 'asc' };
+      }
+
+      const defaultDirection: CompanySortState['direction'] =
+        key === 'company_status' || key === 'issued_documents_count' || key === 'issued_last_at'
+          ? 'desc'
+          : 'asc';
+
+      return { key, direction: defaultDirection };
+    });
+  }
+
+  function companySortIndicator(key: CompanySortKey): string {
+    if (companySort.key !== key) {
+      return 'v';
+    }
+
+    return companySort.direction === 'asc' ? '^' : 'v';
+  }
+
+  async function toggleOne(companyId: number, isEnabled: boolean) {
+    if (!matrix) return;
+    const verticalCode = selectedVerticalByCompany[companyId] ?? matrix.verticals[0]?.code ?? '';
+    if (!verticalCode) { setMessage('Selecciona un rubro.'); setIsError(true); return; }
+    setLoading(true); setMessage(''); setIsError(false);
+    try {
+      const result = await updateCompanyVerticalAdminMatrix(accessToken, {
+        company_id: companyId,
+        vertical_code: verticalCode,
+        is_enabled: isEnabled,
+        make_primary: true,
+      });
+      setMatrix(result);
+      setMessage(isEnabled ? 'Empresa activada correctamente.' : 'Empresa desactivada.');
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo actualizar la empresa');
+      setIsError(true);
+    } finally { setLoading(false); }
+  }
+
+  async function toggleBulk(isEnabled: boolean) {
+    if (!matrix) return;
+    const verticalCode = bulkVerticalCode || matrix.verticals[0]?.code || '';
+    const companyIds   = filteredCompanies.map(c => c.company_id);
+    if (!verticalCode) { setMessage('Selecciona el rubro para la acción masiva.'); setIsError(true); return; }
+    if (companyIds.length === 0) { setMessage('No hay empresas en el filtro actual.'); setIsError(true); return; }
+    setLoading(true); setMessage(''); setIsError(false);
+    try {
+      const result = await updateCompanyVerticalAdminMatrixBulk(accessToken, {
+        company_ids: companyIds,
+        vertical_code: verticalCode,
+        is_enabled: isEnabled,
+        make_primary: true,
+      });
+      setMatrix(result);
+      setMessage(
+        isEnabled
+          ? `Activación masiva completada — ${companyIds.length} empresa(s).`
+          : `Desactivación masiva completada — ${companyIds.length} empresa(s).`
+      );
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo ejecutar la acción masiva');
+      setIsError(true);
+    } finally { setLoading(false); }
+  }
+
+  async function saveCompanySubscription(companyId: number) {
+    const draft = subscriptionDraftByCompany[companyId];
+    if (!draft) {
+      return;
+    }
+
+    setLoading(true);
+    setMessage('');
+    setIsError(false);
+    try {
+      const result = await updateCompanySubscriptionAdminMatrix(accessToken, {
+        company_id: companyId,
+        billing_cycle: draft.billing_cycle,
+        status: draft.status,
+        source: draft.source,
+        alerts_enabled: draft.alerts_enabled,
+        enforcement_mode: draft.enforcement_mode,
+        starts_at: draft.starts_at,
+        current_period_starts_at: draft.current_period_starts_at,
+        current_period_ends_at: draft.current_period_ends_at,
+        reminder_days_before: draft.reminder_days_before,
+        grace_days: draft.grace_days,
+        soft_block_days_after: draft.soft_block_days_after,
+        hard_block_days_after: draft.hard_block_days_after,
+        admin_email_enabled: draft.admin_email_enabled,
+        admin_email_recipients: draft.admin_email_recipients,
+        admin_email_frequency: draft.admin_email_frequency,
+        admin_email_send_hour: draft.admin_email_send_hour,
+        notes: draft.notes,
+      });
+
+      setMatrix(result);
+
+      const nextSubscriptionDrafts: CompanySubscriptionDraftMap = {};
+      for (const company of result.companies) {
+        nextSubscriptionDrafts[company.company_id] = cloneSubscriptionDraft(company.subscription);
+      }
+      setSubscriptionDraftByCompany(nextSubscriptionDrafts);
+      setMessage('Suscripcion actualizada.');
+    } catch (err) {
+      setMessage(handleApiError(err, 'No se pudo actualizar la suscripcion.'));
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveRateOne(companyId: number) {
+    const draft = rateDraftByCompany[companyId];
+    if (!draft) {
+      setMessage('No se encontraron valores para guardar.');
+      setIsError(true);
+      return;
+    }
+
+    setLoading(true);
+    setMessage('');
+    setIsError(false);
+    try {
+      const result = await updateCompanyRateLimitMatrix(accessToken, {
+        company_id: companyId,
+        is_enabled: draft.is_enabled,
+        requests_per_minute_read: draft.requests_per_minute_read,
+        requests_per_minute_write: draft.requests_per_minute_write,
+        requests_per_minute_reports: draft.requests_per_minute_reports,
+        response_delay_enabled: draft.response_delay_enabled,
+        response_delay_ms: draft.response_delay_ms,
+        plan_code: draft.plan_code,
+        preset_code: draft.plan_code !== 'CUSTOM' ? draft.plan_code : undefined,
+      });
+      setRateMatrix(result);
+      setRateDraftByCompany(() => {
+        const next: Record<number, {
+          is_enabled: boolean;
+          requests_per_minute_read: number;
+          requests_per_minute_write: number;
+          requests_per_minute_reports: number;
+          response_delay_enabled: boolean;
+          response_delay_ms: number;
+          plan_code: 'BASIC' | 'PRO' | 'ENTERPRISE' | 'CUSTOM';
+        }> = {};
+        for (const company of result.companies) {
+          next[company.company_id] = {
+            is_enabled: company.is_enabled,
+            requests_per_minute_read: company.requests_per_minute_read,
+            requests_per_minute_write: company.requests_per_minute_write,
+            requests_per_minute_reports: company.requests_per_minute_reports,
+            response_delay_enabled: company.response_delay_enabled,
+            response_delay_ms: company.response_delay_ms,
+            plan_code: company.plan_code,
+          };
+        }
+        return next;
+      });
+      setMessage('Límite por empresa actualizado.');
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo actualizar el límite por empresa');
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveRateBulk(isEnabled: boolean) {
+    const companyIds = filteredCompanies.map(c => c.company_id);
+    if (companyIds.length === 0) {
+      setMessage('No hay empresas en el filtro actual.');
+      setIsError(true);
+      return;
+    }
+
+    setLoading(true);
+    setMessage('');
+    setIsError(false);
+    try {
+      const result = await updateCompanyRateLimitMatrixBulk(accessToken, {
+        company_ids: companyIds,
+        is_enabled: isEnabled,
+        requests_per_minute_read: bulkRateRead,
+        requests_per_minute_write: bulkRateWrite,
+        requests_per_minute_reports: bulkRateReports,
+        plan_code: bulkPresetCode,
+        preset_code: bulkPresetCode,
+      });
+      setRateMatrix(result);
+      setRateDraftByCompany(() => {
+        const next: Record<number, {
+          is_enabled: boolean;
+          requests_per_minute_read: number;
+          requests_per_minute_write: number;
+          requests_per_minute_reports: number;
+          response_delay_enabled: boolean;
+          response_delay_ms: number;
+          plan_code: 'BASIC' | 'PRO' | 'ENTERPRISE' | 'CUSTOM';
+        }> = {};
+        for (const company of result.companies) {
+          next[company.company_id] = {
+            is_enabled: company.is_enabled,
+            requests_per_minute_read: company.requests_per_minute_read,
+            requests_per_minute_write: company.requests_per_minute_write,
+            requests_per_minute_reports: company.requests_per_minute_reports,
+            response_delay_enabled: company.response_delay_enabled,
+            response_delay_ms: company.response_delay_ms,
+            plan_code: company.plan_code,
+          };
+        }
+        return next;
+      });
+      setMessage(`Límites masivos aplicados en ${companyIds.length} empresa(s).`);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo ejecutar la actualización masiva de límites');
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveOperationalOne(companyId: number) {
+    const draft = opDraftByCompany[companyId];
+    if (!draft) {
+      setMessage('No se encontraron límites operativos para guardar.');
+      setIsError(true);
+      return;
+    }
+
+    setLoading(true);
+    setMessage('');
+    setIsError(false);
+    try {
+      const result = await updateCompanyOperationalLimitMatrix(accessToken, {
+        company_id: companyId,
+        max_branches_enabled: draft.max_branches_enabled,
+        max_warehouses_enabled: draft.max_warehouses_enabled,
+        max_cash_registers_enabled: draft.max_cash_registers_enabled,
+        max_cash_registers_per_warehouse: draft.max_cash_registers_per_warehouse,
+      });
+      setOperationalMatrix(result);
+      setMessage('Límite operativo por empresa actualizado.');
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo actualizar límite operativo');
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveOperationalBulk() {
+    const companyIds = filteredCompanies.map(c => c.company_id);
+    if (companyIds.length === 0) {
+      setMessage('No hay empresas en el filtro actual.');
+      setIsError(true);
+      return;
+    }
+
+    setLoading(true);
+    setMessage('');
+    setIsError(false);
+    try {
+      const result = await updateCompanyOperationalLimitMatrixBulk(accessToken, {
+        company_ids: companyIds,
+        max_branches_enabled: bulkOpBranches,
+        max_warehouses_enabled: bulkOpWarehouses,
+        max_cash_registers_enabled: bulkOpCash,
+        max_cash_registers_per_warehouse: bulkOpCashPerWarehouse,
+      });
+      setOperationalMatrix(result);
+      setMessage(`Límites operativos masivos aplicados en ${companyIds.length} empresa(s).`);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo ejecutar la actualización masiva de límites operativos');
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveGlobalSubscriptionSchedule() {
+    setLoading(true);
+    setMessage('');
+    setIsError(false);
+
+    try {
+      const result = await updateGlobalSubscriptionSchedule(accessToken, {
+        company_subscription_alert_frequency: subscriptionFrequency,
+        company_subscription_alert_time: subscriptionAlertTime,
+        company_subscription_weekly_digest_day: subscriptionWeeklyDigestDay,
+        company_subscription_monthly_digest_day: subscriptionMonthlyDigestDay,
+      });
+
+      setGlobalSubscriptionSchedule(result);
+      const schedule = result.schedule;
+      setSubscriptionFrequency(schedule.company_subscription_alert_frequency ?? 'WEEKLY');
+      setSubscriptionAlertTime(schedule.company_subscription_alert_time ?? '08:00');
+      setSubscriptionWeeklyDigestDay(schedule.company_subscription_weekly_digest_day ?? 1);
+      setSubscriptionMonthlyDigestDay(schedule.company_subscription_monthly_digest_day ?? 1);
+      setMessage('Programación global de suscripciones actualizada.');
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo actualizar la programación global de suscripciones');
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function applyBulkPreset() {
+    if (!rateMatrix) return;
+    const preset = rateMatrix.presets.find(p => p.code === bulkPresetCode);
+    if (!preset) return;
+    setBulkRateRead(preset.requests_per_minute_read);
+    setBulkRateWrite(preset.requests_per_minute_write);
+    setBulkRateReports(preset.requests_per_minute_reports);
+  }
+
+  async function copyCompanyAccessLink(companyId: number) {
+    const row = matrix?.companies.find(c => c.company_id === companyId);
+    if (!row?.access_url) {
+      setMessage('La empresa aun no tiene link de acceso.');
+      setIsError(true);
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(row.access_url);
+      setMessage(`Link copiado: ${row.access_url}`);
+      setIsError(false);
+    } catch {
+      setMessage('No se pudo copiar el link.');
+      setIsError(true);
+    }
+  }
+
+  async function createCompanyFromAdmin() {
+    if (!createDraft.tax_id.trim() || !createDraft.legal_name.trim() || !createDraft.admin_username.trim() || !createDraft.admin_password.trim() || !createDraft.admin_first_name.trim()) {
+      setMessage('Completa RUC, razon social y datos del admin inicial.');
+      setIsError(true);
+      return;
+    }
+
+    setLoading(true);
+    setMessage('');
+    setIsError(false);
+    try {
+      const result = await createAdminCompany(accessToken, {
+        tax_id: createDraft.tax_id.trim(),
+        legal_name: createDraft.legal_name.trim(),
+        trade_name: createDraft.trade_name.trim() || undefined,
+        email: createDraft.email.trim() || undefined,
+        phone: createDraft.phone.trim() || undefined,
+        address: createDraft.address.trim() || undefined,
+        vertical_code: createDraft.vertical_code || undefined,
+        main_branch_code: createDraft.main_branch_code.trim() || undefined,
+        main_branch_name: createDraft.main_branch_name.trim() || undefined,
+        create_default_warehouse: createDraft.create_default_warehouse,
+        default_warehouse_code: createDraft.default_warehouse_code.trim() || undefined,
+        default_warehouse_name: createDraft.default_warehouse_name.trim() || undefined,
+        create_default_cash_register: createDraft.create_default_cash_register,
+        default_cash_register_code: createDraft.default_cash_register_code.trim() || undefined,
+        default_cash_register_name: createDraft.default_cash_register_name.trim() || undefined,
+        admin_username: createDraft.admin_username.trim(),
+        admin_password: createDraft.admin_password,
+        admin_first_name: createDraft.admin_first_name.trim(),
+        admin_last_name: createDraft.admin_last_name.trim() || undefined,
+        admin_email: createDraft.admin_email.trim() || undefined,
+        admin_phone: createDraft.admin_phone.trim() || undefined,
+        plan_code: createDraft.plan_code,
+        preset_code: createDraft.preset_code,
+      });
+
+      await loadMatrix(false);
+      setRateMatrix(null);
+      setOperationalMatrix(null);
+      setCommerceMatrix(null);
+      setSunatMatrix(null);
+      setInventoryMatrix(null);
+      setCreateDraft(prev => ({
+        ...prev,
+        tax_id: '',
+        legal_name: '',
+        trade_name: '',
+        email: '',
+        phone: '',
+        address: '',
+        admin_username: '',
+        admin_password: '',
+        admin_first_name: '',
+        admin_last_name: '',
+        admin_email: '',
+        admin_phone: '',
+      }));
+      setAdminUsernameTouched(false);
+      setMessage(`Empresa creada (ID ${result.company_id}) con admin inicial.`);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'No se pudo crear la empresa');
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshBackupHistory(targetPage = backupHistoryPage) {
+    if (selectedBackupCompanyId === null) {
+      setBackupRows([]);
+      setBackupHistoryTotal(0);
+      setBackupHistoryLastPage(1);
+      return;
+    }
+
+    setBackupHistoryLoading(true);
+    try {
+      const result = await listSystemDatabaseBackups(
+        accessToken,
+        selectedBackupCompanyId,
+        targetPage,
+        BACKUP_PAGE_SIZE
+      );
+      setBackupRows(result.backups);
+      setBackupHistoryPage(result.pagination.page);
+      setBackupHistoryTotal(result.pagination.total);
+      setBackupHistoryLastPage(result.pagination.last_page);
+    } catch (err) {
+      setMessage(handleApiError(err, 'No se pudo cargar el historial de respaldos.'));
+      setIsError(true);
+    } finally {
+      setBackupHistoryLoading(false);
+    }
+  }
+
+  async function exportSystemBackup() {
+    if (selectedBackupCompanyId === null) {
+      setMessage('Selecciona una empresa para generar su respaldo.');
+      setIsError(true);
+      return;
+    }
+
+    setLoading(true);
+    setMessage('');
+    setIsError(false);
+    try {
+      const { blob, fileName } = await downloadSystemDatabaseBackup(accessToken, selectedBackupCompanyId);
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = downloadUrl;
+      anchor.download = fileName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      window.URL.revokeObjectURL(downloadUrl);
+      setMessage(`Respaldo generado y descargado: ${fileName}`);
+      await refreshBackupHistory(1);
+    } catch (err) {
+      setMessage(handleApiError(err, 'No se pudo exportar el respaldo de base de datos.'));
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function downloadExistingBackup(fileName: string) {
+    if (selectedBackupCompanyId === null) {
+      setMessage('Selecciona una empresa para descargar su respaldo.');
+      setIsError(true);
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const { blob, fileName: resolvedFileName } = await downloadSystemDatabaseBackupFile(
+        accessToken,
+        selectedBackupCompanyId,
+        fileName
+      );
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = downloadUrl;
+      anchor.download = resolvedFileName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      window.URL.revokeObjectURL(downloadUrl);
+      setMessage(`Respaldo descargado: ${resolvedFileName}`);
+      setIsError(false);
+    } catch (err) {
+      setMessage(handleApiError(err, 'No se pudo descargar el respaldo seleccionado.'));
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function restoreCompanyBackup() {
+    if (selectedBackupCompanyId === null) {
+      setMessage('Selecciona una empresa para restaurar su respaldo.');
+      setIsError(true);
+      return;
+    }
+
+    if (!restoreBackupFile) {
+      setMessage('Selecciona un archivo .sql para restaurar.');
+      setIsError(true);
+      return;
+    }
+
+    if (!confirm('Esta accion reemplazara los datos actuales de la empresa seleccionada. ¿Deseas continuar?')) {
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const result = await restoreSystemDatabaseBackup(accessToken, selectedBackupCompanyId, restoreBackupFile);
+      setMessage(result.message || 'Restauracion completada correctamente.');
+      setIsError(false);
+      setRestoreBackupFile(null);
+      setRestoreInputKey((prev) => prev + 1);
+      await refreshBackupHistory(1);
+      await loadMatrix();
+    } catch (err) {
+      setMessage(handleApiError(err, 'No se pudo restaurar el respaldo seleccionado.'));
+      setIsError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const totalCompanies  = matrix?.companies.length ?? 0;
+  const activeCompanies = matrix?.companies.filter(c => c.active_vertical_code).length ?? 0;
+  const totalVerticals  = matrix?.verticals.length ?? 0;
+  const pendingCompanies = totalCompanies - activeCompanies;
+  const filteredCount = sortedCompanies.length;
+  const totalCompanyPages = Math.max(1, Math.ceil(sortedCompanies.length / PAGE_SIZE));
+  const paginatedCompanies = useMemo(() => {
+    const start = (currentCompanyPage - 1) * PAGE_SIZE;
+    return sortedCompanies.slice(start, start + PAGE_SIZE);
+  }, [currentCompanyPage, sortedCompanies]);
+  const detailCompany = useMemo(
+    () => (matrix?.companies ?? []).find((company) => company.company_id === detailCompanyId) ?? null,
+    [detailCompanyId, matrix?.companies]
+  );
+
+  function highlightMatch(text: string | null | undefined) {
+    const value = text ?? '—';
+    const query = debouncedSearchText.trim();
+    if (!query) return <>{value}</>;
+    const lower = value.toLowerCase();
+    const queryLower = query.toLowerCase();
+    const index = lower.indexOf(queryLower);
+    if (index === -1) return <>{value}</>;
+
+    const before = value.slice(0, index);
+    const match = value.slice(index, index + query.length);
+    const after = value.slice(index + query.length);
+    return (
+      <>
+        {before}
+        <mark className="adm-mark">{match}</mark>
+        {after}
+      </>
+    );
+  }
+
+  const panelMeta: Record<AdminPanelKey, { title: string; subtitle: string }> = {
+    companies: {
+      title: 'Empresas y accesos',
+      subtitle: 'Alta, activación, rubros y credenciales desde una sola vista operativa.',
+    },
+    operational: {
+      title: 'Capacidad operativa',
+      subtitle: 'Define límites de sucursales, almacenes y cajas según demanda de cada cliente.',
+    },
+    rate: {
+      title: 'Rate limits',
+      subtitle: 'Controla la carga y aísla impacto por empresa para mantener estabilidad.',
+    },
+    commerce: {
+      title: 'Funcionalidades comerciales',
+      subtitle: 'Activa o pausa módulos de ventas y compras por compañía.',
+    },
+    sunat: {
+      title: 'SUNAT y reconciliacion',
+      subtitle: 'Configura por empresa la cadencia de reintentos, lotes y alertas de excepciones.',
+    },
+    inventory: {
+      title: 'Inventario avanzado',
+      subtitle: 'Ajusta complejidad, lotes, vencimientos y reglas de stock por empresa.',
+    },
+  };
+
+  return (
+    <>
+      <div className="adm-page-header">
+        <h2>Control de Empresas</h2>
+        <p>Administración centralizada de rubros, límites, reglas comerciales e inventario por empresa.</p>
+      </div>
+
+      <div className="adm-workspace-hero">
+        <div>
+          <div className="adm-workspace-kicker">Centro de operación</div>
+          <h3>{panelMeta[activePanel].title}</h3>
+          <p>{panelMeta[activePanel].subtitle}</p>
+        </div>
+        <div className="adm-workspace-actions">
+          <button className="adm-btn adm-btn-secondary" type="button" onClick={() => void refreshAllPanels()} disabled={loading}>
+            Refrescar datos
+          </button>
+          <span className="adm-badge adm-badge-blue">Panel activo: {panelMeta[activePanel].title}</span>
+        </div>
+      </div>
+
+      {/* Stats */}
+      <div className="adm-stats-row">
+        <div className="adm-stat-card accent">
+          <div className="adm-stat-label">Total empresas</div>
+          <div className="adm-stat-value">{totalCompanies}</div>
+          <div className="adm-stat-sub">registradas en el sistema</div>
+        </div>
+        <div className="adm-stat-card ok">
+          <div className="adm-stat-label">Con rubro activo</div>
+          <div className="adm-stat-value">{activeCompanies}</div>
+          <div className="adm-stat-sub">empresas configuradas</div>
+        </div>
+        <div className="adm-stat-card">
+          <div className="adm-stat-label">Rubros disponibles</div>
+          <div className="adm-stat-value">{totalVerticals}</div>
+          <div className="adm-stat-sub">en el catálogo</div>
+        </div>
+        <div className="adm-stat-card warn">
+          <div className="adm-stat-label">Sin rubro</div>
+          <div className="adm-stat-value">{totalCompanies - activeCompanies}</div>
+          <div className="adm-stat-sub">pendientes de configurar</div>
+        </div>
+      </div>
+
+      <div className="adm-panel-nav" role="tablist" aria-label="Paneles administrativos">
+        <button type="button" role="tab" aria-selected={activePanel === 'companies'} className={`adm-panel-tab${activePanel === 'companies' ? ' is-active' : ''}`} onClick={() => setActivePanel('companies')}>Empresas</button>
+        <button type="button" role="tab" aria-selected={activePanel === 'operational'} className={`adm-panel-tab${activePanel === 'operational' ? ' is-active' : ''}`} onClick={() => setActivePanel('operational')}>Límites operativos</button>
+        <button type="button" role="tab" aria-selected={activePanel === 'rate'} className={`adm-panel-tab${activePanel === 'rate' ? ' is-active' : ''}`} onClick={() => setActivePanel('rate')}>Rate limits</button>
+        <button type="button" role="tab" aria-selected={activePanel === 'commerce'} className={`adm-panel-tab${activePanel === 'commerce' ? ' is-active' : ''}`} onClick={() => setActivePanel('commerce')}>Funcionalidades</button>
+        <button type="button" role="tab" aria-selected={activePanel === 'sunat'} className={`adm-panel-tab${activePanel === 'sunat' ? ' is-active' : ''}`} onClick={() => setActivePanel('sunat')}>SUNAT</button>
+        <button type="button" role="tab" aria-selected={activePanel === 'inventory'} className={`adm-panel-tab${activePanel === 'inventory' ? ' is-active' : ''}`} onClick={() => setActivePanel('inventory')}>Inventario</button>
+      </div>
+
+      <div className="adm-kpi-strip">
+        <div className="adm-kpi-chip">
+          <span className="adm-kpi-chip__label">Empresas filtradas</span>
+          <strong>{filteredCount}</strong>
+        </div>
+        <div className="adm-kpi-chip">
+          <span className="adm-kpi-chip__label">Pendientes por rubro</span>
+          <strong>{pendingCompanies}</strong>
+        </div>
+        <div className="adm-kpi-chip">
+          <span className="adm-kpi-chip__label">Estado</span>
+          <strong>{loading ? 'Sincronizando...' : 'Actualizado'}</strong>
+        </div>
+      </div>
+
+      {message && (
+        <div className={`adm-notice ${isError ? 'adm-notice-err' : 'adm-notice-ok'}`}>
+          {message}
+        </div>
+      )}
+
+      {activePanel === 'companies' && (
+      <div className="adm-card">
+        <div className="adm-card-header">
+          <h3>Respaldo de base de datos</h3>
+          <div className="adm-card-header-actions">
+            <button className="adm-btn adm-btn-secondary" type="button" onClick={() => void refreshBackupHistory()} disabled={loading || backupHistoryLoading}>
+              Refrescar historial
+            </button>
+          </div>
+        </div>
+        <div className="adm-card-body adm-backup-body">
+          <p className="adm-backup-intro">
+            Genera un respaldo por empresa, descarga historicos y restaura cuando sea necesario.
+          </p>
+          <div className="adm-backup-selector-row">
+            <div className="adm-autocomplete-wrap adm-backup-company-autocomplete">
+              <input
+                className="adm-input"
+                placeholder="Buscar empresa por nombre o RUC para respaldo..."
+                value={backupCompanyQuery}
+                disabled={loading || backupHistoryLoading || !matrix}
+                autoComplete="off"
+                onChange={(e) => {
+                  setBackupCompanyQuery(e.target.value);
+                  setBackupCompanyDropdownOpen(true);
+                  if (!e.target.value.trim()) {
+                    setSelectedBackupCompanyId(null);
+                    setBackupHistoryPage(1);
+                  }
+                }}
+                onFocus={() => setBackupCompanyDropdownOpen(true)}
+                onBlur={() => setTimeout(() => setBackupCompanyDropdownOpen(false), 150)}
+              />
+              {backupCompanyDropdownOpen && matrix && (() => {
+                const q = backupCompanyQuery.trim().toLowerCase();
+                const filtered = q
+                  ? matrix.companies.filter((company) =>
+                      company.legal_name.toLowerCase().includes(q)
+                      || (company.trade_name ?? '').toLowerCase().includes(q)
+                      || (company.tax_id ?? '').toLowerCase().includes(q)
+                    )
+                  : matrix.companies;
+
+                if (filtered.length === 0) {
+                  return null;
+                }
+
+                return (
+                  <div className="adm-autocomplete-list">
+                    {filtered.slice(0, 20).map((company) => (
+                      <button
+                        key={`backup-company-row-${company.company_id}`}
+                        type="button"
+                        className={`adm-autocomplete-item${selectedBackupCompanyId === company.company_id ? ' adm-autocomplete-item--active' : ''}`}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => {
+                          setSelectedBackupCompanyId(company.company_id);
+                          setBackupHistoryPage(1);
+                          setBackupCompanyQuery(company.legal_name + (company.tax_id ? ` (${company.tax_id})` : ''));
+                          setBackupCompanyDropdownOpen(false);
+                        }}
+                      >
+                        <span className="adm-autocomplete-item__name">{company.legal_name}</span>
+                        {company.trade_name && <span className="adm-autocomplete-item__sub">{company.trade_name}</span>}
+                        {company.tax_id && <span className="adm-autocomplete-item__ruc">{company.tax_id}</span>}
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+
+          <div className="adm-backup-actions-row">
+            <button className="adm-btn adm-btn-secondary" type="button" onClick={() => void exportSystemBackup()} disabled={loading || selectedBackupCompanyId === null}>
+              Exportar backup de empresa
+            </button>
+            <div className="adm-backup-file-picker">
+              <input
+                id="adm-backup-restore-file"
+                key={restoreInputKey}
+                className="adm-backup-file-native"
+                type="file"
+                accept=".sql,text/plain"
+                onChange={(e) => setRestoreBackupFile(e.target.files?.[0] ?? null)}
+                disabled={loading || selectedBackupCompanyId === null}
+              />
+              <label
+                htmlFor="adm-backup-restore-file"
+                className="adm-btn adm-btn-secondary"
+                aria-disabled={loading || selectedBackupCompanyId === null}
+              >
+                Seleccionar .sql
+              </label>
+              <span className="adm-backup-file-name" title={restoreBackupFile?.name ?? ''}>
+                {restoreBackupFile?.name ?? 'Ningun archivo seleccionado'}
+              </span>
+            </div>
+            <button className="adm-btn adm-btn-danger" type="button" onClick={() => void restoreCompanyBackup()} disabled={loading || selectedBackupCompanyId === null || !restoreBackupFile}>
+              Restaurar backup seleccionado
+            </button>
+          </div>
+
+          <div className="adm-backup-guidance">
+            <p><strong>Local:</strong> exporta, descarga y restaura desde este mismo panel con la empresa seleccionada.</p>
+            <p><strong>Nube:</strong> funciona igual desde Portal Admin porque la operacion se ejecuta en backend Laravel.</p>
+            <p><strong>Importante:</strong> restaura solo backups de la misma empresa para evitar inconsistencias.</p>
+          </div>
+
+          <div className="adm-table-wrap">
+            <table className="adm-table">
+              <thead>
+                <tr>
+                  <th>Archivo</th>
+                  <th>Tamano</th>
+                  <th>Generado</th>
+                  <th>Accion</th>
+                </tr>
+              </thead>
+              <tbody>
+                {backupRows.length === 0 && (
+                  <tr>
+                    <td colSpan={4}>{backupHistoryLoading ? 'Cargando historial...' : 'No hay respaldos disponibles aun.'}</td>
+                  </tr>
+                )}
+                {backupRows.map((row) => (
+                  <tr key={row.file_name}>
+                    <td style={{ fontFamily: 'monospace' }}>{row.file_name}</td>
+                    <td>{row.size_label}</td>
+                    <td>{new Intl.DateTimeFormat('es-PE', { dateStyle: 'short', timeStyle: 'short', timeZone: 'America/Lima' }).format(new Date(row.generated_at))}</td>
+                    <td>
+                      <button
+                        className="adm-btn adm-btn-primary"
+                        type="button"
+                        disabled={loading}
+                        onClick={() => void downloadExistingBackup(row.file_name)}
+                      >
+                        Descargar
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="adm-pagination">
+            <button
+              className="adm-btn adm-btn-secondary"
+              type="button"
+              disabled={backupHistoryLoading || backupHistoryPage <= 1}
+              onClick={() => setBackupHistoryPage(1)}
+            >
+              Inicio
+            </button>
+            <button
+              className="adm-btn adm-btn-secondary"
+              type="button"
+              disabled={backupHistoryLoading || backupHistoryPage <= 1}
+              onClick={() => setBackupHistoryPage((prev) => Math.max(1, prev - 1))}
+            >
+              Anterior
+            </button>
+            <span className="adm-pagination__meta">
+              Pagina {backupHistoryPage} de {backupHistoryLastPage} ({backupHistoryTotal} respaldos)
+            </span>
+            <button
+              className="adm-btn adm-btn-secondary"
+              type="button"
+              disabled={backupHistoryLoading || backupHistoryPage >= backupHistoryLastPage}
+              onClick={() => setBackupHistoryPage((prev) => Math.min(backupHistoryLastPage, prev + 1))}
+            >
+              Siguiente
+            </button>
+            <button
+              className="adm-btn adm-btn-secondary"
+              type="button"
+              disabled={backupHistoryLoading || backupHistoryPage >= backupHistoryLastPage}
+              onClick={() => setBackupHistoryPage(backupHistoryLastPage)}
+            >
+              Última
+            </button>
+          </div>
+        </div>
+      </div>
+      )}
+
+      {activePanel === 'companies' && (
+      <div className="adm-wizard-card">
+        {/* Wizard header */}
+        <div className="adm-wizard-header">
+          <div className="adm-wizard-title">
+            <div className="adm-wizard-icon">&#xFF0B;</div>
+            <div>
+              <div className="adm-wizard-label">Nueva empresa</div>
+              <div className="adm-wizard-sub">Completa los 3 pasos. Todo se crea en una sola operación.</div>
+            </div>
+          </div>
+          <div className="adm-wizard-stepper">
+            {([1, 2, 3] as const).map(n => (
+              <button
+                key={n}
+                type="button"
+                className={`adm-wizard-step${createStep === n ? ' is-active' : ''}${createStep > n ? ' is-done' : ''}`}
+                onClick={() => setCreateStep(n)}
+                disabled={loading}
+              >
+                <span className="adm-wizard-step__num">{createStep > n ? '✓' : n}</span>
+                <span className="adm-wizard-step__label">
+                  {n === 1 ? 'Empresa' : n === 2 ? 'Estructura' : 'Administrador'}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="adm-wizard-body">
+          {/* PASO 1 — Datos empresa */}
+          {createStep === 1 && (
+            <div className="adm-wizard-step-pane">
+              <p className="adm-wizard-step-desc">Datos tributarios y de contacto de la empresa cliente.</p>
+              <div className="adm-wizard-fields">
+                <div className="adm-field-group adm-field-group--required">
+                  <label>RUC</label>
+                  <input className="adm-input" placeholder="Ej: 20123456789" maxLength={11} value={createDraft.tax_id} onChange={e => setCreateDraft(prev => ({ ...prev, tax_id: e.target.value }))} />
+                </div>
+                <div className="adm-field-group adm-field-group--required">
+                  <label>Razón social</label>
+                  <input className="adm-input" placeholder="Nombre legal registrado en SUNAT" value={createDraft.legal_name} onChange={e => setCreateDraft(prev => ({ ...prev, legal_name: e.target.value }))} />
+                </div>
+                <div className="adm-field-group">
+                  <label>Nombre comercial</label>
+                  <input className="adm-input" placeholder="Nombre que usa en el mercado" value={createDraft.trade_name} onChange={e => setCreateDraft(prev => ({ ...prev, trade_name: e.target.value }))} />
+                </div>
+                <div className="adm-field-group">
+                  <label>Email empresa</label>
+                  <input className="adm-input" type="email" placeholder="empresa@ejemplo.com" value={createDraft.email} onChange={e => setCreateDraft(prev => ({ ...prev, email: e.target.value }))} />
+                </div>
+                <div className="adm-field-group">
+                  <label>Teléfono</label>
+                  <input className="adm-input" placeholder="+51 ..." value={createDraft.phone} onChange={e => setCreateDraft(prev => ({ ...prev, phone: e.target.value }))} />
+                </div>
+                <div className="adm-field-group adm-field-group--wide">
+                  <label>Dirección fiscal</label>
+                  <input className="adm-input" placeholder="Av. / Jr. / Calle y número" value={createDraft.address} onChange={e => setCreateDraft(prev => ({ ...prev, address: e.target.value }))} />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* PASO 2 — Estructura y plan */}
+          {createStep === 2 && (
+            <div className="adm-wizard-step-pane">
+              <p className="adm-wizard-step-desc">Define el rubro, plan y estructura operativa inicial (sucursal, almacén, caja).</p>
+              <div className="adm-wizard-fields">
+                <div className="adm-field-group">
+                  <label>Rubro</label>
+                  <select className="adm-select" value={createDraft.vertical_code} onChange={e => setCreateDraft(prev => ({ ...prev, vertical_code: e.target.value }))}>
+                    <option value="">Rubro por defecto</option>
+                    {matrix?.verticals.map(v => <option key={`new-${v.code}`} value={v.code}>{v.name} ({v.code})</option>)}
+                  </select>
+                </div>
+                <div className="adm-field-group">
+                  <label>Plan</label>
+                  <select className="adm-select" value={createDraft.plan_code} onChange={e => setCreateDraft(prev => ({ ...prev, plan_code: e.target.value as 'BASIC' | 'PRO' | 'ENTERPRISE' | 'CUSTOM' }))}>
+                    <option value="BASIC">BASIC</option>
+                    <option value="PRO">PRO</option>
+                    <option value="ENTERPRISE">ENTERPRISE</option>
+                    <option value="CUSTOM">CUSTOM</option>
+                  </select>
+                </div>
+                <div className="adm-field-group">
+                  <label>Preset de límites</label>
+                  <select className="adm-select" value={createDraft.preset_code} onChange={e => setCreateDraft(prev => ({ ...prev, preset_code: e.target.value as 'BASIC' | 'PRO' | 'ENTERPRISE' }))}>
+                    <option value="BASIC">BASIC</option>
+                    <option value="PRO">PRO</option>
+                    <option value="ENTERPRISE">ENTERPRISE</option>
+                  </select>
+                </div>
+
+                <div className="adm-wizard-divider">Sucursal principal</div>
+                <div className="adm-field-group">
+                  <label>Código sucursal</label>
+                  <input className="adm-input" placeholder="001" value={createDraft.main_branch_code} onChange={e => setCreateDraft(prev => ({ ...prev, main_branch_code: e.target.value }))} />
+                </div>
+                <div className="adm-field-group">
+                  <label>Nombre sucursal</label>
+                  <input className="adm-input" placeholder="Sucursal Principal" value={createDraft.main_branch_name} onChange={e => setCreateDraft(prev => ({ ...prev, main_branch_name: e.target.value }))} />
+                </div>
+
+                <div className="adm-wizard-divider">Almacén y caja</div>
+                <div className="adm-field-group">
+                  <label>Almacén inicial</label>
+                  <select className="adm-select" value={createDraft.create_default_warehouse ? '1' : '0'} onChange={e => setCreateDraft(prev => ({ ...prev, create_default_warehouse: e.target.value === '1' }))}>
+                    <option value="1">Crear almacén inicial</option>
+                    <option value="0">No crear</option>
+                  </select>
+                </div>
+                <div className="adm-field-group">
+                  <label>Código almacén</label>
+                  <input className="adm-input" placeholder="ALM-001" value={createDraft.default_warehouse_code} onChange={e => setCreateDraft(prev => ({ ...prev, default_warehouse_code: e.target.value }))} />
+                </div>
+                <div className="adm-field-group">
+                  <label>Nombre almacén</label>
+                  <input className="adm-input" placeholder="Almacén Principal" value={createDraft.default_warehouse_name} onChange={e => setCreateDraft(prev => ({ ...prev, default_warehouse_name: e.target.value }))} />
+                </div>
+                <div className="adm-field-group">
+                  <label>Caja inicial</label>
+                  <select className="adm-select" value={createDraft.create_default_cash_register ? '1' : '0'} onChange={e => setCreateDraft(prev => ({ ...prev, create_default_cash_register: e.target.value === '1' }))}>
+                    <option value="1">Crear caja inicial</option>
+                    <option value="0">No crear</option>
+                  </select>
+                </div>
+                <div className="adm-field-group">
+                  <label>Código caja</label>
+                  <input className="adm-input" placeholder="CAJA-001" value={createDraft.default_cash_register_code} onChange={e => setCreateDraft(prev => ({ ...prev, default_cash_register_code: e.target.value }))} />
+                </div>
+                <div className="adm-field-group">
+                  <label>Nombre caja</label>
+                  <input className="adm-input" placeholder="Caja Principal" value={createDraft.default_cash_register_name} onChange={e => setCreateDraft(prev => ({ ...prev, default_cash_register_name: e.target.value }))} />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* PASO 3 — Administrador */}
+          {createStep === 3 && (
+            <div className="adm-wizard-step-pane">
+              <p className="adm-wizard-step-desc">Crea el usuario administrador que gestionará esta empresa desde el sistema.</p>
+              <div className="adm-wizard-fields">
+                <div className="adm-field-group adm-field-group--required">
+                  <label>Usuario</label>
+                  <input
+                    className="adm-input"
+                    placeholder="admin_20123456789"
+                    value={createDraft.admin_username}
+                    onChange={e => {
+                      setAdminUsernameTouched(true);
+                      setCreateDraft(prev => ({ ...prev, admin_username: e.target.value }));
+                    }}
+                  />
+                  <small className="adm-field-help">Sugerido: admin_RUC (puedes cambiarlo manualmente).</small>
+                </div>
+                <div className="adm-field-group adm-field-group--required">
+                  <label>Contraseña inicial</label>
+                  <input className="adm-input" type="password" placeholder="Mínimo 8 caracteres" value={createDraft.admin_password} onChange={e => setCreateDraft(prev => ({ ...prev, admin_password: e.target.value }))} />
+                </div>
+                <div className="adm-field-group adm-field-group--required">
+                  <label>Nombre</label>
+                  <input className="adm-input" placeholder="Nombre del admin" value={createDraft.admin_first_name} onChange={e => setCreateDraft(prev => ({ ...prev, admin_first_name: e.target.value }))} />
+                </div>
+                <div className="adm-field-group">
+                  <label>Apellido</label>
+                  <input className="adm-input" placeholder="Apellido" value={createDraft.admin_last_name} onChange={e => setCreateDraft(prev => ({ ...prev, admin_last_name: e.target.value }))} />
+                </div>
+                <div className="adm-field-group">
+                  <label>Email admin</label>
+                  <input className="adm-input" type="email" placeholder="admin@empresa.com" value={createDraft.admin_email} onChange={e => setCreateDraft(prev => ({ ...prev, admin_email: e.target.value }))} />
+                </div>
+                <div className="adm-field-group">
+                  <label>Teléfono admin</label>
+                  <input className="adm-input" placeholder="+51 ..." value={createDraft.admin_phone} onChange={e => setCreateDraft(prev => ({ ...prev, admin_phone: e.target.value }))} />
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="adm-wizard-footer">
+          {createStep > 1 && (
+            <button className="adm-btn adm-btn-secondary" type="button" disabled={loading} onClick={() => setCreateStep((prev) => (prev - 1) as 1 | 2 | 3)}>
+              ← Anterior
+            </button>
+          )}
+          <span style={{ flex: 1 }} />
+          {createStep < 3 ? (
+            <button className="adm-btn adm-btn-primary" type="button" disabled={loading} onClick={() => setCreateStep((prev) => (prev + 1) as 1 | 2 | 3)}>
+              Siguiente →
+            </button>
+          ) : (
+            <button className="adm-btn adm-btn-create" type="button" disabled={loading} onClick={() => void createCompanyFromAdmin()}>
+              ✓ Crear empresa
+            </button>
+          )}
+        </div>
+      </div>
+      )}
+
+      {activePanel === 'companies' && (
+      <div className="adm-card">
+        <div className="adm-card-header">
+          <h3>Empresas registradas</h3>
+          <div className="adm-card-header-actions">
+            {loading && <span style={{ fontSize: '0.8rem', color: '#64748b' }}>Procesando...</span>}
+          </div>
+        </div>
+
+        <div className="adm-card-body">
+          {/* Filtros */}
+          <div className="adm-toolbar adm-toolbar-sticky">
+            <input
+              className="adm-input"
+              placeholder="Buscar por empresa o RUC..."
+              value={searchText}
+              onChange={e => setSearchText(e.target.value)}
+            />
+            <select
+              className="adm-select"
+              value={filterVerticalCode}
+              onChange={e => setFilterVerticalCode(e.target.value)}
+            >
+              <option value="">Todos los rubros</option>
+              {matrix?.verticals.map(v => (
+                <option key={`filter-${v.code}`} value={v.code}>{v.name} ({v.code})</option>
+              ))}
+            </select>
+            <span className="adm-hint-inline">Tip: aplica filtro antes de ejecutar acciones masivas.</span>
+          </div>
+
+          {/* Acción masiva */}
+          {matrix && (
+            <div className="adm-bulk-bar">
+              <span className="adm-bulk-bar-label">Acción masiva</span>
+              <select
+                className="adm-select"
+                value={bulkVerticalCode}
+                onChange={e => setBulkVerticalCode(e.target.value)}
+                disabled={loading}
+              >
+                {matrix.verticals.map(v => (
+                  <option key={`bulk-${v.code}`} value={v.code}>{v.name} ({v.code})</option>
+                ))}
+              </select>
+              <button
+                className="adm-btn adm-btn-success"
+                type="button"
+                disabled={loading || filteredCompanies.length === 0 || !bulkVerticalCode}
+                onClick={() => void toggleBulk(true)}
+              >
+                ✓ Activar filtradas
+              </button>
+              <button
+                className="adm-btn adm-btn-danger"
+                type="button"
+                disabled={loading || filteredCompanies.length === 0 || !bulkVerticalCode}
+                onClick={() => void toggleBulk(false)}
+              >
+                ✕ Desactivar filtradas
+              </button>
+              <span className="adm-bulk-count">
+                Mostrando <strong>{paginatedCompanies.length}</strong> de {filteredCompanies.length} filtradas ({totalCompanies} total)
+              </span>
+            </div>
+          )}
+
+          <div className="adm-company-table-wrap">
+            {!matrix && !loading && (
+              <div className="adm-company-empty">Sin datos. Refresca para cargar.</div>
+            )}
+            {matrix && filteredCompanies.length === 0 && (
+              <div className="adm-company-empty">Ninguna empresa coincide con el filtro.</div>
+            )}
+            {matrix && filteredCompanies.length > 0 && (
+              <table className="adm-table adm-company-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>
+                      <button type="button" className={`adm-sort-button${companySort.key === 'legal_name' ? ' is-active' : ''}`} onClick={() => handleCompanySort('legal_name')}>
+                        Empresa
+                        <span className="adm-sort-indicator" aria-hidden="true">{companySortIndicator('legal_name')}</span>
+                      </button>
+                    </th>
+                    <th>
+                      <button type="button" className={`adm-sort-button${companySort.key === 'tax_id' ? ' is-active' : ''}`} onClick={() => handleCompanySort('tax_id')}>
+                        RUC
+                        <span className="adm-sort-indicator" aria-hidden="true">{companySortIndicator('tax_id')}</span>
+                      </button>
+                    </th>
+                    <th>
+                      <button type="button" className={`adm-sort-button${companySort.key === 'active_vertical_name' ? ' is-active' : ''}`} onClick={() => handleCompanySort('active_vertical_name')}>
+                        Rubro
+                        <span className="adm-sort-indicator" aria-hidden="true">{companySortIndicator('active_vertical_name')}</span>
+                      </button>
+                    </th>
+                    <th>
+                      <button type="button" className={`adm-sort-button${companySort.key === 'company_status' ? ' is-active' : ''}`} onClick={() => handleCompanySort('company_status')}>
+                        Estado
+                        <span className="adm-sort-indicator" aria-hidden="true">{companySortIndicator('company_status')}</span>
+                      </button>
+                    </th>
+                    <th>
+                      <button type="button" className={`adm-sort-button${companySort.key === 'issued_documents_count' ? ' is-active' : ''}`} onClick={() => handleCompanySort('issued_documents_count')}>
+                        Comprobantes
+                        <span className="adm-sort-indicator" aria-hidden="true">{companySortIndicator('issued_documents_count')}</span>
+                      </button>
+                    </th>
+                    <th>
+                      <button type="button" className={`adm-sort-button${companySort.key === 'issued_last_at' ? ' is-active' : ''}`} onClick={() => handleCompanySort('issued_last_at')}>
+                        Ultima emision
+                        <span className="adm-sort-indicator" aria-hidden="true">{companySortIndicator('issued_last_at')}</span>
+                      </button>
+                    </th>
+                    <th>
+                      <button type="button" className={`adm-sort-button${companySort.key === 'admin_username' ? ' is-active' : ''}`} onClick={() => handleCompanySort('admin_username')}>
+                        Admin
+                        <span className="adm-sort-indicator" aria-hidden="true">{companySortIndicator('admin_username')}</span>
+                      </button>
+                    </th>
+                    <th>Suscripcion</th>
+                    <th>Accion</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {paginatedCompanies.map((company, idx) => {
+                    const isActive = company.company_status === 1;
+                    return (
+                      <tr key={company.company_id}>
+                        <td className="adm-company-index">{(currentCompanyPage - 1) * PAGE_SIZE + idx + 1}</td>
+                        <td>
+                          <div className="adm-company-name-cell">
+                            <span className="adm-td-label">{highlightMatch(company.legal_name)}</span>
+                            {company.trade_name && <span className="adm-td-sub">{highlightMatch(company.trade_name)}</span>}
+                          </div>
+                        </td>
+                        <td>
+                          <span className="adm-row-ruc">{highlightMatch(company.tax_id)}</span>
+                        </td>
+                        <td>
+                          {company.active_vertical_name
+                            ? <span className="adm-badge adm-badge-blue">{company.active_vertical_name}</span>
+                            : <span className="adm-badge adm-badge-neutral">Sin rubro</span>
+                          }
+                        </td>
+                        <td>
+                          <span className="adm-company-status-cell">
+                            <span className={`adm-row-dot${isActive ? ' adm-row-dot--on' : ' adm-row-dot--off'}`} />
+                            <span className={`adm-badge ${isActive ? 'adm-badge-ok' : 'adm-badge-off'}`}>{isActive ? 'Activa' : 'Inactiva'}</span>
+                          </span>
+                        </td>
+                        <td>
+                          <span className="adm-row-issued" title="Comprobantes emitidos">
+                            {Number(company.issued_documents_count ?? 0).toLocaleString('es-PE')} comp.
+                          </span>
+                        </td>
+                        <td>
+                          <span className="adm-row-last-issued" title="Ultima emision de comprobante (Lima)">
+                            <span>{formatLastIssuedAtLabel(company.issued_last_at)}</span>
+                            {company.issued_last_at ? (
+                              <small>{formatLastIssuedAgoLabel(company.issued_last_at)}</small>
+                            ) : null}
+                          </span>
+                        </td>
+                        <td>
+                          {company.admin_username
+                            ? <span className="adm-row-admin-name">{company.admin_username}</span>
+                            : <span className="adm-badge adm-badge-neutral">Sin admin</span>
+                          }
+                        </td>
+                        <td>
+                          <div className="adm-company-subscription-cell">
+                            <span className={`adm-badge ${subscriptionBadgeClass(company.subscription.alert_state)}`}>{subscriptionStateLabel(company.subscription)}</span>
+                            <span className="adm-td-sub">{formatSubscriptionDueText(company.subscription)}</span>
+                          </div>
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            className="adm-company-open-btn"
+                            onClick={() => {
+                              setDetailTab('general');
+                              setDetailCompanyId(company.company_id);
+                              setDetailDrawerOpen(true);
+                            }}
+                          >
+                            Ver detalle
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          {filteredCompanies.length > PAGE_SIZE && (
+            <div className="adm-pagination">
+              <button
+                className="adm-btn adm-btn-secondary"
+                type="button"
+                disabled={currentCompanyPage <= 1}
+                onClick={() => setCurrentCompanyPage(1)}
+              >
+                Inicio
+              </button>
+              <button
+                className="adm-btn adm-btn-secondary"
+                type="button"
+                disabled={currentCompanyPage <= 1}
+                onClick={() => setCurrentCompanyPage((prev) => Math.max(1, prev - 1))}
+              >
+                Anterior
+              </button>
+              <span className="adm-pagination__meta">Página {currentCompanyPage} de {totalCompanyPages}</span>
+              <button
+                className="adm-btn adm-btn-secondary"
+                type="button"
+                disabled={currentCompanyPage >= totalCompanyPages}
+                onClick={() => setCurrentCompanyPage((prev) => Math.min(totalCompanyPages, prev + 1))}
+              >
+                Siguiente
+              </button>
+              <button
+                className="adm-btn adm-btn-secondary"
+                type="button"
+                disabled={currentCompanyPage >= totalCompanyPages}
+                onClick={() => setCurrentCompanyPage(totalCompanyPages)}
+              >
+                Última
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+      )}
+
+      {activePanel === 'operational' && (
+      <div className="adm-card">
+        <div className="adm-card-header">
+          <h3>Límites operativos por empresa</h3>
+          <div className="adm-card-header-actions">
+            <span style={{ fontSize: '0.8rem', color: '#64748b' }}>
+              Defaults mínimos: sucursales 1, almacenes 1, cajas 1, cajas/almacén 1
+            </span>
+          </div>
+        </div>
+        <div className="adm-card-body">
+          <div className="adm-panel-subcard" style={{ marginBottom: '1rem' }}>
+            <div className="adm-panel-subcard__header">
+              <div>
+                <div className="adm-panel-subcard__eyebrow">Sistema</div>
+                <h4 className="adm-panel-subcard__title">Programación global de suscripciones</h4>
+                <p className="adm-panel-subcard__hint">Este ajuste define cuándo corre el resumen global y se aplica a Railway después del despliegue.</p>
+              </div>
+              <span className="adm-badge adm-badge-blue">Global</span>
+            </div>
+
+            <div className="adm-panel-subcard__grid">
+              <label>
+                Frecuencia
+                <select className="adm-select" value={subscriptionFrequency} onChange={e => setSubscriptionFrequency(e.target.value as 'DAILY' | 'WEEKLY' | 'MONTHLY')} disabled={loading}>
+                  <option value="DAILY">Diario</option>
+                  <option value="WEEKLY">Semanal</option>
+                  <option value="MONTHLY">Mensual</option>
+                </select>
+              </label>
+              <label>
+                Hora envío
+                <input className="adm-input" type="time" value={subscriptionAlertTime} onChange={e => setSubscriptionAlertTime(e.target.value)} disabled={loading} />
+              </label>
+              <label>
+                Día semanal
+                <input className="adm-input adm-input-mini" type="number" min={1} max={7} value={subscriptionWeeklyDigestDay} onChange={e => setSubscriptionWeeklyDigestDay(Number(e.target.value || 1))} disabled={loading || subscriptionFrequency === 'MONTHLY'} />
+              </label>
+              <label>
+                Día mensual
+                <input className="adm-input adm-input-mini" type="number" min={1} max={28} value={subscriptionMonthlyDigestDay} onChange={e => setSubscriptionMonthlyDigestDay(Number(e.target.value || 1))} disabled={loading || subscriptionFrequency !== 'MONTHLY'} />
+              </label>
+            </div>
+
+            <div className="adm-panel-subcard__actions">
+              <button className="adm-btn adm-btn-primary" type="button" disabled={loading} onClick={() => void saveGlobalSubscriptionSchedule()}>
+                Guardar programación global
+              </button>
+            </div>
+          </div>
+
+          <div className="adm-bulk-bar">
+            <span className="adm-bulk-bar-label">Ajuste masivo operativo</span>
+            <input className="adm-input adm-input-mini" type="number" min={1} max={10000} value={bulkOpBranches} onChange={e => setBulkOpBranches(Number(e.target.value || 1))} disabled={loading} title="Sucursales max" />
+            <input className="adm-input adm-input-mini" type="number" min={1} max={10000} value={bulkOpWarehouses} onChange={e => setBulkOpWarehouses(Number(e.target.value || 1))} disabled={loading} title="Almacenes max" />
+            <input className="adm-input adm-input-mini" type="number" min={1} max={10000} value={bulkOpCash} onChange={e => setBulkOpCash(Number(e.target.value || 1))} disabled={loading} title="Cajas max" />
+            <input className="adm-input adm-input-mini" type="number" min={1} max={10000} value={bulkOpCashPerWarehouse} onChange={e => setBulkOpCashPerWarehouse(Number(e.target.value || 1))} disabled={loading} title="Cajas por almacén" />
+            <button className="adm-btn adm-btn-primary" type="button" disabled={loading || filteredCompanies.length === 0} onClick={() => void saveOperationalBulk()}>
+              Guardar límites operativos filtradas
+            </button>
+          </div>
+
+          <div className="adm-table-wrap">
+            <table className="adm-table">
+              <thead>
+                <tr>
+                  <th>Empresa</th>
+                  <th>Sucursales max</th>
+                  <th>Almacenes max</th>
+                  <th>Cajas max</th>
+                  <th>Cajas por almacén max</th>
+                  <th>Uso actual</th>
+                  <th>Guardar</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredCompanies.map(company => {
+                  const opRow = operationalMatrix?.companies.find(r => r.company_id === company.company_id);
+                  const draft = opDraftByCompany[company.company_id] ?? {
+                    max_branches_enabled: 1,
+                    max_warehouses_enabled: 1,
+                    max_cash_registers_enabled: 1,
+                    max_cash_registers_per_warehouse: 1,
+                  };
+
+                  return (
+                    <tr key={`op-${company.company_id}`}>
+                      <td>
+                        <span className="adm-td-label">{company.legal_name}</span>
+                        {company.trade_name && <span className="adm-td-sub">{company.trade_name}</span>}
+                      </td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={1} max={10000} value={draft.max_branches_enabled} onChange={e => setOpDraftByCompany(prev => ({ ...prev, [company.company_id]: { ...draft, max_branches_enabled: Number(e.target.value || 1) } }))} disabled={loading} /></td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={1} max={10000} value={draft.max_warehouses_enabled} onChange={e => setOpDraftByCompany(prev => ({ ...prev, [company.company_id]: { ...draft, max_warehouses_enabled: Number(e.target.value || 1) } }))} disabled={loading} /></td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={1} max={10000} value={draft.max_cash_registers_enabled} onChange={e => setOpDraftByCompany(prev => ({ ...prev, [company.company_id]: { ...draft, max_cash_registers_enabled: Number(e.target.value || 1) } }))} disabled={loading} /></td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={1} max={10000} value={draft.max_cash_registers_per_warehouse} onChange={e => setOpDraftByCompany(prev => ({ ...prev, [company.company_id]: { ...draft, max_cash_registers_per_warehouse: Number(e.target.value || 1) } }))} disabled={loading} /></td>
+                      <td>
+                        <span className="adm-td-sub">S: {opRow?.usage_branches ?? 0} | A: {opRow?.usage_warehouses ?? 0} | C: {opRow?.usage_cash_registers ?? 0}</span>
+                      </td>
+                      <td>
+                        <button className="adm-btn adm-btn-primary" type="button" disabled={loading} onClick={() => void saveOperationalOne(company.company_id)}>
+                          Guardar
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      )}
+
+      {activePanel === 'rate' && (
+      <div className="adm-card">
+        <div className="adm-card-header">
+          <h3>Límites por empresa (aislamiento de carga)</h3>
+          <div className="adm-card-header-actions">
+            <span style={{ fontSize: '0.8rem', color: '#64748b' }}>
+              {rateMatrix
+                ? `Defaults: lectura ${rateMatrix.defaults.requests_per_minute_read}/min, escritura ${rateMatrix.defaults.requests_per_minute_write}/min, reportes ${rateMatrix.defaults.requests_per_minute_reports}/min`
+                : 'Cargando defaults...'}
+            </span>
+          </div>
+        </div>
+        <div className="adm-card-body">
+          <p className="adm-td-sub">
+            La demora agrega latencia por solicitud; no limita el ancho de banda. Las suscripciones pagadas activas y al día no reciben demora.
+          </p>
+          <div className="adm-bulk-bar">
+            <span className="adm-bulk-bar-label">Ajuste masivo de límites</span>
+            <select
+              className="adm-select"
+              value={bulkPresetCode}
+              onChange={e => setBulkPresetCode((e.target.value as 'BASIC' | 'PRO' | 'ENTERPRISE'))}
+              disabled={loading || !rateMatrix}
+              title="Preset de plan"
+            >
+              {rateMatrix?.presets.map(p => (
+                <option key={`preset-${p.code}`} value={p.code}>{p.name}</option>
+              ))}
+            </select>
+            <button
+              className="adm-btn adm-btn-secondary"
+              type="button"
+              disabled={loading || !rateMatrix}
+              onClick={applyBulkPreset}
+            >
+              Aplicar preset
+            </button>
+            <input
+              className="adm-input adm-input-mini"
+              type="number"
+              min={100}
+              max={60000}
+              value={bulkRateRead}
+              onChange={e => setBulkRateRead(Number(e.target.value || 0))}
+              disabled={loading}
+              title="Lectura por minuto"
+            />
+            <input
+              className="adm-input adm-input-mini"
+              type="number"
+              min={100}
+              max={60000}
+              value={bulkRateWrite}
+              onChange={e => setBulkRateWrite(Number(e.target.value || 0))}
+              disabled={loading}
+              title="Escritura por minuto"
+            />
+            <input
+              className="adm-input adm-input-mini"
+              type="number"
+              min={100}
+              max={60000}
+              value={bulkRateReports}
+              onChange={e => setBulkRateReports(Number(e.target.value || 0))}
+              disabled={loading}
+              title="Reportes por minuto"
+            />
+            <button
+              className="adm-btn adm-btn-success"
+              type="button"
+              disabled={loading || filteredCompanies.length === 0}
+              onClick={() => void saveRateBulk(true)}
+            >
+              Guardar y habilitar filtradas
+            </button>
+            <button
+              className="adm-btn adm-btn-danger"
+              type="button"
+              disabled={loading || filteredCompanies.length === 0}
+              onClick={() => void saveRateBulk(false)}
+            >
+              Guardar y deshabilitar filtradas
+            </button>
+          </div>
+
+          <div className="adm-table-wrap">
+            <table className="adm-table">
+              <thead>
+                <tr>
+                  <th>Empresa</th>
+                  <th>RUC</th>
+                  <th>Plan</th>
+                  <th>Lectura/min</th>
+                  <th>Escritura/min</th>
+                  <th>Reportes/min</th>
+                  <th>Demora demo</th>
+                  <th>Límite</th>
+                  <th>Guardar</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredCompanies.map(company => {
+                  const draft = rateDraftByCompany[company.company_id] ?? {
+                    is_enabled: true,
+                    requests_per_minute_read: rateMatrix?.defaults.requests_per_minute_read ?? 3600,
+                    requests_per_minute_write: rateMatrix?.defaults.requests_per_minute_write ?? 2400,
+                    requests_per_minute_reports: rateMatrix?.defaults.requests_per_minute_reports ?? 900,
+                    response_delay_enabled: false,
+                    response_delay_ms: 0,
+                    plan_code: 'PRO' as const,
+                  };
+
+                  return (
+                    <tr key={`rate-${company.company_id}`}>
+                      <td>
+                        <span className="adm-td-label">{company.legal_name}</span>
+                        {company.trade_name && <span className="adm-td-sub">{company.trade_name}</span>}
+                      </td>
+                      <td style={{ fontFamily: 'monospace', color: '#475569' }}>{company.tax_id ?? '—'}</td>
+                      <td>
+                        <select
+                          className="adm-select"
+                          value={draft.plan_code}
+                          onChange={e => setRateDraftByCompany(prev => ({
+                            ...prev,
+                            [company.company_id]: {
+                              ...draft,
+                              plan_code: e.target.value as 'BASIC' | 'PRO' | 'ENTERPRISE' | 'CUSTOM',
+                            },
+                          }))}
+                          disabled={loading}
+                        >
+                          <option value="BASIC">Basic</option>
+                          <option value="PRO">Pro</option>
+                          <option value="ENTERPRISE">Enterprise</option>
+                          <option value="CUSTOM">Custom</option>
+                        </select>
+                      </td>
+                      <td>
+                        <input
+                          className="adm-input adm-input-mini"
+                          type="number"
+                          min={100}
+                          max={60000}
+                          value={draft.requests_per_minute_read}
+                          onChange={e => setRateDraftByCompany(prev => ({
+                            ...prev,
+                            [company.company_id]: {
+                              ...draft,
+                              requests_per_minute_read: Number(e.target.value || 0),
+                            },
+                          }))}
+                          disabled={loading}
+                        />
+                      </td>
+                      <td>
+                        <input
+                          className="adm-input adm-input-mini"
+                          type="number"
+                          min={100}
+                          max={60000}
+                          value={draft.requests_per_minute_write}
+                          onChange={e => setRateDraftByCompany(prev => ({
+                            ...prev,
+                            [company.company_id]: {
+                              ...draft,
+                              requests_per_minute_write: Number(e.target.value || 0),
+                            },
+                          }))}
+                          disabled={loading}
+                        />
+                      </td>
+                      <td>
+                        <input
+                          className="adm-input adm-input-mini"
+                          type="number"
+                          min={100}
+                          max={60000}
+                          value={draft.requests_per_minute_reports}
+                          onChange={e => setRateDraftByCompany(prev => ({
+                            ...prev,
+                            [company.company_id]: {
+                              ...draft,
+                              requests_per_minute_reports: Number(e.target.value || 0),
+                            },
+                          }))}
+                          disabled={loading}
+                        />
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          <select
+                            className="adm-select"
+                            value={draft.response_delay_enabled ? '1' : '0'}
+                            onChange={e => setRateDraftByCompany(prev => ({
+                              ...prev,
+                              [company.company_id]: {
+                                ...draft,
+                                response_delay_enabled: e.target.value === '1',
+                              },
+                            }))}
+                            disabled={loading}
+                            aria-label={`Estado de demora para ${company.legal_name}`}
+                          >
+                            <option value="0">Sin demora</option>
+                            <option value="1">Aplicar demora</option>
+                          </select>
+                          <input
+                            className="adm-input adm-input-mini"
+                            type="number"
+                            min={0}
+                            max={rateMatrix?.defaults.max_response_delay_ms ?? 0}
+                            step={100}
+                            value={draft.response_delay_ms}
+                            onChange={e => setRateDraftByCompany(prev => ({
+                              ...prev,
+                              [company.company_id]: {
+                                ...draft,
+                                response_delay_ms: Number(e.target.value || 0),
+                              },
+                            }))}
+                            disabled={loading || !draft.response_delay_enabled}
+                            aria-label={`Demora en milisegundos para ${company.legal_name}`}
+                            title="Milisegundos agregados por solicitud"
+                          />
+                          <span className="adm-td-sub">ms por solicitud</span>
+                        </div>
+                      </td>
+                      <td>
+                        <select
+                          className="adm-select"
+                          value={draft.is_enabled ? '1' : '0'}
+                          onChange={e => setRateDraftByCompany(prev => ({
+                            ...prev,
+                            [company.company_id]: {
+                              ...draft,
+                              is_enabled: e.target.value === '1',
+                            },
+                          }))}
+                          disabled={loading}
+                        >
+                          <option value="1">Habilitado</option>
+                          <option value="0">Pausado</option>
+                        </select>
+                      </td>
+                      <td>
+                        <button
+                          className="adm-btn adm-btn-primary"
+                          type="button"
+                          disabled={loading}
+                          onClick={() => void saveRateOne(company.company_id)}
+                        >
+                          Guardar
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      )}
+
+      {/* Commerce features — card-based per-company activation */}
+      {activePanel === 'commerce' && (
+      <div className="adm-card">
+        <div className="adm-card-header">
+          <h3>Activación de funcionalidades por empresa</h3>
+          <div className="adm-card-header-actions">
+            <span style={{ fontSize: '0.8rem', color: '#64748b' }}>Ventas y compras — configuradas por empresa desde Admin</span>
+          </div>
+        </div>
+        <div className="adm-card-body">
+          {/* Company autocomplete selector */}
+          <div className="adm-features-company-selector">
+            <label>Empresa:</label>
+            <div className="adm-autocomplete-wrap" style={{ position: 'relative', flex: '1 1 280px', maxWidth: 480 }}>
+              <input
+                className="adm-input"
+                placeholder="Buscar empresa por nombre o RUC…"
+                value={commerceCompanyQuery}
+                disabled={loading || !commerceMatrix}
+                autoComplete="off"
+                onChange={e => {
+                  setCommerceCompanyQuery(e.target.value);
+                  setCommerceCompanyDropdownOpen(true);
+                  if (!e.target.value.trim()) {
+                    setSelectedCommerceCompanyId(null);
+                  }
+                }}
+                onFocus={() => setCommerceCompanyDropdownOpen(true)}
+                onBlur={() => setTimeout(() => setCommerceCompanyDropdownOpen(false), 150)}
+              />
+              {commerceCompanyDropdownOpen && commerceMatrix && (() => {
+                const q = commerceCompanyQuery.trim().toLowerCase();
+                const filtered = q
+                  ? commerceMatrix.companies.filter(c =>
+                      c.legal_name.toLowerCase().includes(q) ||
+                      (c.trade_name ?? '').toLowerCase().includes(q) ||
+                      (c.tax_id ?? '').toLowerCase().includes(q)
+                    )
+                  : commerceMatrix.companies;
+                if (filtered.length === 0) return null;
+                return (
+                  <div className="adm-autocomplete-list">
+                    {filtered.slice(0, 20).map(c => (
+                      <button
+                        key={c.company_id}
+                        type="button"
+                        className={`adm-autocomplete-item${selectedCommerceCompanyId === c.company_id ? ' adm-autocomplete-item--active' : ''}`}
+                        onMouseDown={e => e.preventDefault()}
+                        onClick={() => {
+                          setSelectedCommerceCompanyId(c.company_id);
+                          setCommerceCompanyQuery(
+                            c.legal_name + (c.tax_id ? ` (${c.tax_id})` : '')
+                          );
+                          setCommerceCompanyDropdownOpen(false);
+                        }}
+                      >
+                        <span className="adm-autocomplete-item__name">{c.legal_name}</span>
+                        {c.trade_name && <span className="adm-autocomplete-item__sub">{c.trade_name}</span>}
+                        {c.tax_id && <span className="adm-autocomplete-item__ruc">{c.tax_id}</span>}
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()}
+            </div>
+            {selectedCommerceCompanyId && (
+              <button
+                className="adm-btn adm-btn-primary"
+                type="button"
+                disabled={loading}
+                onClick={() => void saveCommerceOne(selectedCommerceCompanyId)}
+              >
+                Guardar cambios
+              </button>
+            )}
+          </div>
+
+          {!selectedCommerceCompanyId && (
+            <div className="adm-features-empty">Selecciona una empresa para ver y configurar sus funcionalidades.</div>
+          )}
+
+          {selectedCommerceCompanyId && (() => {
+            const featureCodes = allCommerceFeatureCodes;
+            const companyOriginal = commerceMatrix?.companies.find(c => c.company_id === selectedCommerceCompanyId)?.features;
+            const draft = commerceDraftByCompany[selectedCommerceCompanyId]
+              ?? normalizeCompanyFeatures(featureCodes, companyOriginal);
+
+            const salesCodes    = featureCodes.filter(c => c.toUpperCase().startsWith('SALES_'));
+            const purchasesCodes = featureCodes.filter(c => c.toUpperCase().startsWith('PURCHASES_'));
+            const otherCodes    = featureCodes.filter(c => !c.toUpperCase().startsWith('SALES_') && !c.toUpperCase().startsWith('PURCHASES_'));
+
+            const renderSection = (label: string, codes: string[]) => {
+              if (codes.length === 0) return null;
+              return (
+                <div key={label}>
+                  <div className="adm-features-section-header">
+                    <h4>{label}</h4>
+                    <span className="adm-features-section-count">{codes.length} funcionalidades</span>
+                  </div>
+                  <div className="adm-feature-grid">
+                    {codes.map(code => {
+                      const enabled = draft[code] ?? false;
+                      return (
+                        <div
+                          key={code}
+                          className={`adm-feature-card${enabled ? ' adm-feature-card--on' : ''}`}
+                          title={code}
+                        >
+                          <div className="adm-feature-card__header">
+                            <span className="adm-feature-card__name">{featureLabel(code, commerceFeatureLabelsByCode)}</span>
+                            <label className="adm-switch">
+                              <input
+                                type="checkbox"
+                                checked={enabled}
+                                disabled={loading}
+                                onChange={e => setCommerceDraftByCompany(prev => ({
+                                  ...prev,
+                                  [selectedCommerceCompanyId]: {
+                                    ...(prev[selectedCommerceCompanyId] ?? {}),
+                                    [code]: e.target.checked,
+                                  },
+                                }))}
+                              />
+                              <span className="adm-switch__slider" />
+                            </label>
+                          </div>
+                          <div className="adm-feature-card__meta">
+                            <span className="adm-feature-badge adm-feature-badge--fallback">Fallback empresa/sucursal</span>
+                            <span className={`adm-feature-badge${enabled ? ' adm-feature-badge--on' : ''}`}>
+                              {enabled ? 'Activo' : 'Inactivo'}
+                            </span>
+                            <span className="adm-feature-badge adm-feature-badge--admin">Gestionado en Admin por empresa</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            };
+
+            return (
+              <>
+                {renderSection('VENTAS', salesCodes)}
+                {renderSection('COMPRAS', purchasesCodes)}
+                {renderSection('OTROS', otherCodes)}
+                <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.5rem' }}>
+                  <button
+                    className="adm-btn adm-btn-primary"
+                    type="button"
+                    disabled={loading}
+                    onClick={() => void saveCommerceOne(selectedCommerceCompanyId)}
+                  >
+                    Guardar cambios
+                  </button>
+                  <button
+                    className="adm-btn adm-btn-secondary"
+                    type="button"
+                    disabled={loading}
+                    onClick={() => {
+                      const original = commerceMatrix?.companies.find(c => c.company_id === selectedCommerceCompanyId)?.features;
+                      setCommerceDraftByCompany(prev => ({
+                        ...prev,
+                        [selectedCommerceCompanyId]: normalizeCompanyFeatures(featureCodes, original),
+                      }));
+                    }}
+                  >
+                    Restablecer
+                  </button>
+                </div>
+              </>
+            );
+          })()}
+        </div>
+      </div>
+      )}
+
+      {activePanel === 'sunat' && (
+      <div className="adm-card">
+        <div className="adm-card-header">
+          <h3>Configuracion SUNAT por empresa</h3>
+          <div className="adm-card-header-actions">
+            <span style={{ fontSize: '0.8rem', color: '#64748b' }}>
+              Ajusta reconciliacion automatica y notificaciones de excepciones sin usar variables de entorno.
+            </span>
+          </div>
+        </div>
+        <div className="adm-card-body">
+          <div className="adm-table-wrap">
+            <table className="adm-table">
+              <thead>
+                <tr>
+                  <th>Empresa</th>
+                  <th>Tax bridge</th>
+                  <th>Auto reconcile</th>
+                  <th>Lote</th>
+                  <th>Cadencia base (min)</th>
+                  <th>Cadencia maxima (min)</th>
+                  <th>Umbral manual (intentos)</th>
+                  <th>Alertas excepciones</th>
+                  <th>Horas umbral</th>
+                  <th>Repetir alerta (min)</th>
+                  <th>Tope alertas corrida</th>
+                  <th>Guardar</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(sunatMatrix?.companies ?? []).map(company => {
+                  const draft = sunatDraftByCompany[company.company_id] ?? {
+                    tax_bridge_enabled: company.tax_bridge_enabled,
+                    settings: { ...company.sunat_reconcile },
+                  };
+
+                  const updateSettings = (patch: Partial<CompanySunatReconcileAdminRecord>) => {
+                    setSunatDraftByCompany(prev => ({
+                      ...prev,
+                      [company.company_id]: {
+                        ...(prev[company.company_id] ?? draft),
+                        settings: {
+                          ...(prev[company.company_id]?.settings ?? draft.settings),
+                          ...patch,
+                        },
+                      },
+                    }));
+                  };
+
+                  return (
+                    <tr key={`sunat-${company.company_id}`}>
+                      <td>
+                        <span className="adm-td-label">{company.legal_name}</span>
+                        {company.trade_name && <span className="adm-td-sub">{company.trade_name}</span>}
+                      </td>
+                      <td>
+                        <select
+                          className="adm-select"
+                          value={draft.tax_bridge_enabled ? '1' : '0'}
+                          onChange={e => setSunatDraftByCompany(prev => ({
+                            ...prev,
+                            [company.company_id]: {
+                              ...(prev[company.company_id] ?? draft),
+                              tax_bridge_enabled: e.target.value === '1',
+                            },
+                          }))}
+                          disabled={loading}
+                        >
+                          <option value="1">Activo</option>
+                          <option value="0">Pausado</option>
+                        </select>
+                      </td>
+                      <td>
+                        <select
+                          className="adm-select"
+                          value={draft.settings.auto_reconcile_enabled ? '1' : '0'}
+                          onChange={e => updateSettings({ auto_reconcile_enabled: e.target.value === '1' })}
+                          disabled={loading}
+                        >
+                          <option value="1">Si</option>
+                          <option value="0">No</option>
+                        </select>
+                      </td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={5} max={200} value={draft.settings.reconcile_batch_size} onChange={e => updateSettings({ reconcile_batch_size: Number(e.target.value || 5) })} disabled={loading} /></td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={1} max={180} value={draft.settings.reconcile_retry_base_minutes} onChange={e => updateSettings({ reconcile_retry_base_minutes: Number(e.target.value || 1) })} disabled={loading} /></td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={5} max={1440} value={draft.settings.reconcile_retry_max_minutes} onChange={e => updateSettings({ reconcile_retry_max_minutes: Number(e.target.value || 5) })} disabled={loading} /></td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={1} max={50} value={draft.settings.reconcile_warn_attempts} onChange={e => updateSettings({ reconcile_warn_attempts: Number(e.target.value || 1) })} disabled={loading} /></td>
+                      <td>
+                        <select
+                          className="adm-select"
+                          value={draft.settings.sunat_exception_notify_enabled ? '1' : '0'}
+                          onChange={e => updateSettings({ sunat_exception_notify_enabled: e.target.value === '1' })}
+                          disabled={loading}
+                        >
+                          <option value="1">Activas</option>
+                          <option value="0">Pausadas</option>
+                        </select>
+                      </td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={1} max={168} value={draft.settings.sunat_exception_notify_hours} onChange={e => updateSettings({ sunat_exception_notify_hours: Number(e.target.value || 1) })} disabled={loading} /></td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={10} max={1440} value={draft.settings.sunat_alert_repeat_minutes} onChange={e => updateSettings({ sunat_alert_repeat_minutes: Number(e.target.value || 10) })} disabled={loading} /></td>
+                      <td><input className="adm-input adm-input-mini" type="number" min={1} max={500} value={draft.settings.sunat_exception_notify_limit} onChange={e => updateSettings({ sunat_exception_notify_limit: Number(e.target.value || 1) })} disabled={loading} /></td>
+                      <td>
+                        <button className="adm-btn adm-btn-primary" type="button" disabled={loading} onClick={() => void saveSunatOne(company.company_id)}>
+                          Guardar
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      )}
+
+      {/* Inventory settings matrix */}
+      {activePanel === 'inventory' && (
+      <div className="adm-section">
+        <div className="adm-section-header">
+          <h3>Configuración de inventario por empresa</h3>
+          <p style={{ margin: '0.35rem 0 0', color: '#64748b' }}>
+            Controla si la venta se bloquea por falta de stock o si se permite continuar con stock negativo.
+          </p>
+        </div>
+        <div className="adm-table-wrap">
+          <table className="adm-table">
+            <thead>
+              <tr>
+                <th>Empresa</th>
+                <th>Modo complejidad</th>
+                <th>Modo inventario</th>
+                <th>Estrategia lotes</th>
+                <th>Inv. Pro</th>
+                <th>Tracking lotes</th>
+                <th>Tracking venc.</th>
+                <th>Rep. avanzado</th>
+                <th>Dashboard gráf.</th>
+                <th>Ubic. control</th>
+                <th>Permitir venta sin stock</th>
+                <th>Exigir lote</th>
+                <th>Umbral stock bajo</th>
+                <th>Acción</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(inventoryMatrix?.companies ?? []).map(company => {
+                const s = inventoryDraftByCompany[company.company_id] ?? company.inventory_settings;
+                const update = (patch: Partial<InventorySettingsRecord>) =>
+                  setInventoryDraftByCompany(prev => ({
+                    ...prev,
+                    [company.company_id]: { ...(prev[company.company_id] ?? company.inventory_settings), ...patch },
+                  }));
+                return (
+                  <tr key={company.company_id}>
+                    <td>
+                      <strong>{company.legal_name}</strong>
+                      <br />
+                      <small>{company.tax_id}</small>
+                    </td>
+                    <td>
+                      <select className="adm-select" value={s.complexity_mode} onChange={e => update({ complexity_mode: e.target.value as InventorySettingsRecord['complexity_mode'] })} disabled={loading}>
+                        <option value="BASIC">Básico</option>
+                        <option value="ADVANCED">Avanzado</option>
+                      </select>
+                    </td>
+                    <td>
+                      <select className="adm-select" value={s.inventory_mode} onChange={e => update({ inventory_mode: e.target.value as InventorySettingsRecord['inventory_mode'] })} disabled={loading}>
+                        <option value="KARDEX_SIMPLE">Kardex simple</option>
+                        <option value="LOT_TRACKING">Por lotes</option>
+                      </select>
+                    </td>
+                    <td>
+                      <select className="adm-select" value={s.lot_outflow_strategy} onChange={e => update({ lot_outflow_strategy: e.target.value as InventorySettingsRecord['lot_outflow_strategy'] })} disabled={loading}>
+                        <option value="MANUAL">Manual</option>
+                        <option value="FIFO">FIFO</option>
+                        <option value="FEFO">FEFO</option>
+                      </select>
+                    </td>
+                    {(['enable_inventory_pro','enable_lot_tracking','enable_expiry_tracking','enable_advanced_reporting','enable_graphical_dashboard','enable_location_control','allow_negative_stock','enforce_lot_for_tracked'] as (keyof InventorySettingsRecord)[]).map(field => (
+                      <td key={field} style={{ textAlign: 'center' }}>
+                        <input
+                          type="checkbox"
+                          checked={s[field] as boolean}
+                          onChange={e => update({ [field]: e.target.checked })}
+                          disabled={loading}
+                        />
+                      </td>
+                    ))}
+                    <td style={{ textAlign: 'center' }}>
+                      <input
+                        type="number"
+                        min={0}
+                        max={9999}
+                        style={{ width: '60px' }}
+                        value={s.low_stock_alert_threshold ?? 5}
+                        onChange={e => update({ low_stock_alert_threshold: Math.max(0, parseInt(e.target.value) || 0) })}
+                        disabled={loading}
+                      />
+                    </td>
+                    <td>
+                      <button
+                        className="adm-btn adm-btn-primary"
+                        type="button"
+                        disabled={loading}
+                        onClick={() => void saveInventoryOne(company.company_id)}
+                      >
+                        Guardar
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      )}
+
+      {detailCompany && detailDrawerOpen && (() => {
+        const selected = selectedVerticalByCompany[detailCompany.company_id] ?? detailCompany.active_vertical_code ?? matrix?.verticals[0]?.code ?? '';
+        const selectedAssign = detailCompany.assignments.find((assignment) => assignment.vertical_code === selected);
+        const isEnabled = Boolean(selectedAssign?.is_enabled);
+        const resetPreview = resetPreviewByCompany[detailCompany.company_id];
+        const revealedPassword = revealedPasswordByCompany[detailCompany.company_id];
+        const subscriptionDraft = subscriptionDraftByCompany[detailCompany.company_id] ?? detailCompany.subscription;
+
+        const updateSubscriptionDraft = (patch: Partial<CompanySubscriptionSummary>) => {
+          setSubscriptionDraftByCompany((prev) => ({
+            ...prev,
+            [detailCompany.company_id]: { ...(prev[detailCompany.company_id] ?? detailCompany.subscription), ...patch },
+          }));
+        };
+
+        const closeDrawer = () => { setDetailDrawerOpen(false); setDetailCompanyId(null); };
+
+        return (
+          <div className="adm-drawer-overlay" role="presentation" onClick={closeDrawer}>
+            <div className="adm-drawer" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+              <div className="adm-drawer-header">
+                <div>
+                  <div className="adm-drawer-title">{detailCompany.legal_name}</div>
+                  <div className="adm-drawer-sub">{detailCompany.tax_id ?? ''}</div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <span className={`adm-badge ${detailCompany.company_status === 1 ? 'adm-badge-ok' : 'adm-badge-off'}`}>
+                    {detailCompany.company_status === 1 ? 'Activa' : 'Inactiva'}
+                  </span>
+                  <button type="button" className="adm-btn-close" onClick={closeDrawer} aria-label="Cerrar">×</button>
+                </div>
+              </div>
+              <div className="adm-drawer-body">
+                <div className="adm-detail-tabs" role="tablist" aria-label="Detalle empresa">
+                  <button type="button" role="tab" aria-selected={detailTab === 'general'} className={`adm-detail-tab${detailTab === 'general' ? ' is-active' : ''}`} onClick={() => setDetailTab('general')}>General</button>
+                  <button type="button" role="tab" aria-selected={detailTab === 'access'} className={`adm-detail-tab${detailTab === 'access' ? ' is-active' : ''}`} onClick={() => setDetailTab('access')}>Acceso</button>
+                  <button type="button" role="tab" aria-selected={detailTab === 'security'} className={`adm-detail-tab${detailTab === 'security' ? ' is-active' : ''}`} onClick={() => setDetailTab('security')}>Seguridad</button>
+                  <button type="button" role="tab" aria-selected={detailTab === 'history'} className={`adm-detail-tab${detailTab === 'history' ? ' is-active' : ''}`} onClick={() => setDetailTab('history')}>Historial</button>
+                </div>
+
+                {detailTab === 'general' && (
+                  <>
+                    <div className="adm-drawer-grid">
+                      <div>
+                        <span className="adm-drawer-field-label">RUC</span>
+                        <div className="adm-drawer-field-value">{detailCompany.tax_id ?? '—'}</div>
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Administrador</span>
+                        {detailCompany.admin_username
+                          ? <div className="adm-drawer-field-value">{detailCompany.admin_username}</div>
+                          : <span className="adm-badge adm-badge-neutral">Sin admin</span>
+                        }
+                        {detailCompany.admin_email && <div className="adm-drawer-field-sub">{detailCompany.admin_email}</div>}
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Rubro activo</span>
+                        {detailCompany.active_vertical_name
+                          ? <span className="adm-badge adm-badge-blue">{detailCompany.active_vertical_name}</span>
+                          : <span className="adm-badge adm-badge-neutral">Sin rubro</span>
+                        }
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Suscripcion</span>
+                        <span className={`adm-badge ${subscriptionBadgeClass(detailCompany.subscription.alert_state)}`}>{subscriptionStateLabel(detailCompany.subscription)}</span>
+                        <div className="adm-drawer-field-sub">{formatSubscriptionDueText(detailCompany.subscription)}</div>
+                      </div>
+                    </div>
+
+                    <div className="adm-drawer-grid">
+                      <div>
+                        <span className="adm-drawer-field-label">Ciclo</span>
+                        <select className="adm-select" value={subscriptionDraft.billing_cycle} onChange={e => updateSubscriptionDraft({ billing_cycle: e.target.value as CompanySubscriptionSummary['billing_cycle'] })} disabled={loading}>
+                          <option value="NONE">Sin configurar</option>
+                          <option value="MONTHLY">Mensual</option>
+                          <option value="ANNUAL">Anual</option>
+                        </select>
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Estado base</span>
+                        <select className="adm-select" value={subscriptionDraft.status} onChange={e => updateSubscriptionDraft({ status: e.target.value as CompanySubscriptionSummary['status'] })} disabled={loading}>
+                          <option value="ACTIVE">Activa</option>
+                          <option value="PAUSED">Pausada</option>
+                          <option value="CANCELED">Cancelada</option>
+                        </select>
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Fuente</span>
+                        <select className="adm-select" value={subscriptionDraft.source} onChange={e => updateSubscriptionDraft({ source: e.target.value as CompanySubscriptionSummary['source'] })} disabled={loading}>
+                          <option value="MANUAL">Manual</option>
+                          <option value="BRIDGE">Puente</option>
+                        </select>
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Alertas</span>
+                        <select className="adm-select" value={subscriptionDraft.alerts_enabled ? '1' : '0'} onChange={e => updateSubscriptionDraft({ alerts_enabled: e.target.value === '1' })} disabled={loading}>
+                          <option value="1">Activas</option>
+                          <option value="0">Pausadas</option>
+                        </select>
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Inicio</span>
+                        <input className="adm-input" type="date" value={subscriptionDraft.starts_at ?? ''} onChange={e => updateSubscriptionDraft({ starts_at: e.target.value || null, current_period_starts_at: e.target.value || null })} disabled={loading} />
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Vencimiento actual</span>
+                        <input className="adm-input" type="date" value={subscriptionDraft.current_period_ends_at ?? ''} onChange={e => updateSubscriptionDraft({ current_period_ends_at: e.target.value || null })} disabled={loading} />
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Avisar antes</span>
+                        <input className="adm-input adm-input-mini" type="number" min={0} max={30} value={subscriptionDraft.reminder_days_before} onChange={e => updateSubscriptionDraft({ reminder_days_before: Number(e.target.value || 0) })} disabled={loading} />
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Dias de gracia</span>
+                        <input className="adm-input adm-input-mini" type="number" min={0} max={60} value={subscriptionDraft.grace_days} onChange={e => updateSubscriptionDraft({ grace_days: Number(e.target.value || 0) })} disabled={loading} />
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Modo escalamiento</span>
+                        <select className="adm-select" value={subscriptionDraft.enforcement_mode} onChange={e => updateSubscriptionDraft({ enforcement_mode: e.target.value as CompanySubscriptionSummary['enforcement_mode'] })} disabled={loading}>
+                          <option value="NONE">Solo alertar</option>
+                          <option value="SOFT">Escalado parcial</option>
+                          <option value="HARD">Escalado fuerte</option>
+                        </select>
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Escalar parcial</span>
+                        <input className="adm-input adm-input-mini" type="number" min={0} max={90} value={subscriptionDraft.soft_block_days_after} onChange={e => updateSubscriptionDraft({ soft_block_days_after: Number(e.target.value || 0) })} disabled={loading} />
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Escalar fuerte</span>
+                        <input className="adm-input adm-input-mini" type="number" min={0} max={180} value={subscriptionDraft.hard_block_days_after} onChange={e => updateSubscriptionDraft({ hard_block_days_after: Number(e.target.value || 0) })} disabled={loading} />
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Correo admin</span>
+                        <select className="adm-select" value={subscriptionDraft.admin_email_enabled ? '1' : '0'} onChange={e => updateSubscriptionDraft({ admin_email_enabled: e.target.value === '1' })} disabled={loading}>
+                          <option value="1">Activo</option>
+                          <option value="0">Pausado</option>
+                        </select>
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Frecuencia correo</span>
+                        <select className="adm-select" value={subscriptionDraft.admin_email_frequency} onChange={e => updateSubscriptionDraft({ admin_email_frequency: e.target.value as CompanySubscriptionSummary['admin_email_frequency'] })} disabled={loading}>
+                          <option value="DAILY">1 vez al dia</option>
+                          <option value="STATE_CHANGE">Solo cambio de estado</option>
+                        </select>
+                      </div>
+                      <div>
+                        <span className="adm-drawer-field-label">Hora envio (0-23)</span>
+                        <input className="adm-input adm-input-mini" type="number" min={0} max={23} value={subscriptionDraft.admin_email_send_hour} onChange={e => updateSubscriptionDraft({ admin_email_send_hour: Number(e.target.value || 0) })} disabled={loading || subscriptionDraft.admin_email_frequency !== 'DAILY'} />
+                      </div>
+                      <div style={{ gridColumn: '1 / -1' }}>
+                        <span className="adm-drawer-field-label">Destinatarios admin (coma o ;)</span>
+                        <input className="adm-input" type="text" value={subscriptionDraft.admin_email_recipients ?? ''} onChange={e => updateSubscriptionDraft({ admin_email_recipients: e.target.value || null })} disabled={loading} placeholder="correo1@empresa.com, correo2@empresa.com" />
+                        <div className="adm-drawer-field-sub">Si se deja vacio, usa los correos ADMIN de plataforma.</div>
+                      </div>
+                      <div style={{ gridColumn: '1 / -1' }}>
+                        <span className="adm-drawer-field-label">Accion sugerida</span>
+                        <div className="adm-drawer-field-value">{detailCompany.subscription.recommended_action ?? 'Sin observaciones'}</div>
+                      </div>
+                    </div>
+
+                    <div className="adm-drawer-actions">
+                      <button className="adm-btn adm-btn-primary" type="button" disabled={loading} onClick={() => void saveCompanySubscription(detailCompany.company_id)}>
+                        Guardar suscripcion
+                      </button>
+                    </div>
+
+                    <div className="adm-drawer-grid">
+                      <div style={{ gridColumn: '1 / -1' }}>
+                        <span className="adm-drawer-field-label">Asignar rubro</span>
+                        <select
+                          className="adm-select"
+                          value={selected}
+                          onChange={e => setSelectedVerticalByCompany(prev => ({ ...prev, [detailCompany.company_id]: e.target.value }))}
+                          disabled={loading}
+                        >
+                          {matrix?.verticals.map(v => (
+                            <option key={`${detailCompany.company_id}-${v.code}`} value={v.code}>
+                              {v.name} ({v.code})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {detailTab === 'access' && (
+                  <div className="adm-drawer-grid">
+                    <div style={{ gridColumn: '1 / -1' }}>
+                      <span className="adm-drawer-field-label">Link de acceso</span>
+                      {detailCompany.access_url ? (
+                        <div className="adm-drawer-actions">
+                          <a href={detailCompany.access_url} target="_blank" rel="noreferrer" className="adm-link-url adm-link-url-block">
+                            {detailCompany.access_url}
+                          </a>
+                          <button className="adm-btn adm-btn-secondary" type="button" disabled={loading} onClick={() => void copyCompanyAccessLink(detailCompany.company_id)}>
+                            Copiar link
+                          </button>
+                        </div>
+                      ) : (
+                        <span className="adm-badge adm-badge-neutral">Sin link de acceso</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {detailTab === 'security' && (
+                  <div className="adm-drawer-grid">
+                    <div style={{ gridColumn: '1 / -1' }}>
+                      <span className="adm-drawer-field-label">Contraseña actual del admin</span>
+                      <div className="adm-drawer-actions" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
+                        {/* Reveal current password */}
+                        {!revealedPassword ? (
+                          <button
+                            className="adm-btn adm-btn-secondary"
+                            type="button"
+                            disabled={revealLoading || !detailCompany.admin_username}
+                            title={detailCompany.admin_username ? 'Ver la última contraseña conocida sin resetear' : 'Esta empresa no tiene admin registrado'}
+                            onClick={() => void doRevealAdminPassword(detailCompany.company_id)}
+                          >
+                            {revealLoading ? 'Consultando...' : '👁️ Ver contraseña'}
+                          </button>
+                        ) : (
+                          <div className="adm-credential-cell" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                            <span className="adm-badge adm-badge-neutral">{revealedPassword.username}</span>
+                            <code style={{ background: '#f0f4ff', padding: '0.2rem 0.5rem', borderRadius: '4px', fontFamily: 'monospace', fontWeight: 600 }}>
+                              {revealedPassword.password}
+                            </code>
+                            <button
+                              className="adm-btn adm-btn-secondary"
+                              type="button"
+                              style={{ fontSize: '0.75rem' }}
+                              onClick={() => setRevealedPasswordByCompany((prev) => ({ ...prev, [detailCompany.company_id]: null }))}
+                            >
+                              Ocultar
+                            </button>
+                          </div>
+                        )}
+
+                        {/* Reset password (last resort) */}
+                        <button
+                          className="adm-btn adm-btn-secondary"
+                          type="button"
+                          disabled={loading || !detailCompany.admin_username}
+                          title={detailCompany.admin_username ? 'Generar nueva contraseña para el admin (último recurso)' : 'Esta empresa no tiene admin registrado'}
+                          onClick={() => void doResetAdminPassword(detailCompany.company_id, detailCompany.legal_name)}
+                        >
+                          🔄 Reset pass
+                        </button>
+
+                        {resetPreview && (
+                          <button
+                            className="adm-btn adm-btn-secondary"
+                            type="button"
+                            disabled={loading}
+                            onClick={() => {
+                              setResetPasswordCopied(false);
+                              setShowResetPassword(false);
+                              setResetModal(resetPreview);
+                            }}
+                          >
+                            Ver clave del último reset
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {detailTab === 'history' && (
+                  <div className="adm-drawer-grid">
+                    <div style={{ gridColumn: '1 / -1' }}>
+                      <span className="adm-drawer-field-label">Último evento registrado</span>
+                      {resetPreview
+                        ? <div className="adm-drawer-field-sub">Reset de contraseña temporal en {resetPreview.generatedAtLabel} (Lima).</div>
+                        : <div className="adm-drawer-field-sub">Sin eventos recientes en esta sesión.</div>
+                      }
+                    </div>
+                  </div>
+                )}
+
+                <div className="adm-drawer-actions">
+                  <button className="adm-btn adm-btn-success" type="button" disabled={loading || isEnabled} onClick={() => void toggleOne(detailCompany.company_id, true)}>
+                    Activar
+                  </button>
+                  <button className="adm-btn adm-btn-danger" type="button" disabled={loading || !isEnabled} onClick={() => void toggleOne(detailCompany.company_id, false)}>
+                    Desactivar
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {resetModal && (
+        <div className="adm-cred-modal-overlay" role="presentation" onClick={() => setResetModal(null)}>
+          <div className="adm-cred-modal" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+            <div className="adm-cred-modal-header">
+              <h4>Credencial temporal generada</h4>
+              <button type="button" className="adm-btn-close" onClick={() => setResetModal(null)} aria-label="Cerrar">×</button>
+            </div>
+            <div className="adm-cred-modal-body">
+              <p className="adm-cred-modal-sub">Comparte esta clave con el cliente y solicita cambio inmediato.</p>
+              <div className="adm-cred-row">
+                <span className="adm-cred-label">Empresa</span>
+                <strong>{resetModal.companyName}</strong>
+              </div>
+              <div className="adm-cred-row">
+                <span className="adm-cred-label">Usuario</span>
+                <code>{resetModal.username}</code>
+              </div>
+              <div className="adm-cred-row">
+                <span className="adm-cred-label">Generada en</span>
+                <strong>{resetModal.generatedAtLabel} (Lima)</strong>
+              </div>
+              <div className="adm-cred-row">
+                <span className="adm-cred-label">Password</span>
+                <div className="adm-cred-password-wrap">
+                  <input className="adm-input" readOnly value={showResetPassword ? resetModal.newPassword : '••••••••••••'} />
+                  <button type="button" className="adm-btn adm-btn-secondary" onClick={() => setShowResetPassword((prev) => !prev)}>
+                    {showResetPassword ? 'Ocultar' : 'Ver'}
+                  </button>
+                  <button type="button" className="adm-btn adm-btn-primary" onClick={() => void copyResetCredentials(resetModal)}>
+                    Copiar
+                  </button>
+                </div>
+              </div>
+              {resetPasswordCopied && <div className="adm-copy-ok">Credencial copiada al portapapeles.</div>}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}

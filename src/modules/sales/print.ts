@@ -1,0 +1,2305 @@
+﻿import { fmtDateLima, fmtDateTimeFullLima } from '../../shared/utils/lima';
+import { apiClient } from '../../shared/api/client';
+
+export type PrintableSalesItem = {
+  lineNo: number;
+  productId?: number | null;
+  productCode?: string | null;
+  unitId?: number | null;
+  priceTierId?: number | null;
+  wholesaleDiscountPercent?: number | null;
+  priceSource?: 'MANUAL' | 'TIER' | 'PROFILE';
+  taxCategoryId?: number | null;
+  taxLabel?: string;
+  taxRate?: number;
+  qtyBase?: number | null;
+  conversionFactor?: number | null;
+  baseUnitPrice?: number | null;
+  metadata?: Record<string, unknown> | null;
+  lots?: Array<{ lot_id: number; qty: number }>;
+  qty: number;
+  unitLabel: string;
+  description: string;
+  unitPrice: number;
+  discountTotal?: number;
+  lineTotal: number;
+};
+
+export type PrintableSalesDocument = {
+  id: number;
+  documentKind: string;
+  series: string;
+  number: number;
+  issueDate: string;
+  dueDate: string | null;
+  status: string;
+  currencyCode: string;
+  currencySymbol: string;
+  paymentMethodName: string;
+  notes?: string | null;
+  customerName: string;
+  customerDocNumber: string;
+  customerAddress: string;
+  customerPhone?: string | null;
+  customerEmail?: string | null;
+  subtotal: number;
+  taxTotal: number;
+  grandTotal: number;
+  gravadaTotal: number;
+  inafectaTotal: number;
+  exoneradaTotal: number;
+  company?: PrintableCompanyProfile | null;
+  metadata?: Record<string, unknown> | null;
+  payments?: Array<{
+    payment_method_id?: number | null;
+    payment_method_name?: string | null;
+    amount: number;
+    status?: string;
+  }>;
+  items: PrintableSalesItem[];
+};
+
+function resolvePaymentPrintRows(doc: PrintableSalesDocument): Array<{ method: string; amount: number }> {
+  const metadata = (doc.metadata ?? {}) as Record<string, unknown>;
+  const rows = Array.isArray(metadata.payment_breakdown)
+    ? metadata.payment_breakdown as Array<Record<string, unknown>>
+    : [];
+  const issued = String(doc.status ?? '').toUpperCase() === 'ISSUED';
+  const persistedPayments = (doc.payments ?? [])
+    .filter((payment) => String(payment.status ?? 'PENDING').toUpperCase() === 'PAID' && Number(payment.amount) > 0)
+    .map((payment) => ({
+      method: String(payment.payment_method_name ?? doc.paymentMethodName ?? 'Método de pago').trim(),
+      amount: Number(payment.amount),
+    }));
+  const metadataPayments = rows
+    .filter((row) => {
+      const status = String(row.status ?? (issued ? 'PAID' : 'PENDING')).toUpperCase();
+      return status !== 'CANCELED' && (!issued || status === 'PAID') && Number(row.amount ?? 0) > 0;
+    })
+    .map((row) => ({
+      method: String(row.payment_method_name ?? row.method_name ?? doc.paymentMethodName ?? 'Método de pago').trim(),
+      amount: Number(row.amount ?? 0),
+    }));
+  const normalized = persistedPayments.length > 0 ? persistedPayments : metadataPayments;
+
+  if (normalized.length > 0) {
+    return normalized;
+  }
+
+  const isCreditCondition = String(metadata.payment_condition ?? '').toUpperCase() === 'CREDITO';
+  const fallbackAmount = isCreditCondition
+    ? Number(metadata.advance_amount ?? 0)
+    : doc.grandTotal;
+
+  return doc.paymentMethodName && fallbackAmount > 0
+    ? [{ method: doc.paymentMethodName, amount: fallbackAmount }]
+    : [];
+}
+
+export type PrintableCompanyProfile = {
+  taxId?: string | null;
+  legalName?: string | null;
+  tradeName?: string | null;
+  companyDescription?: string | null;
+  address?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  logoUrl?: string | null;
+  showPaymentBrandIcons?: boolean | null;
+  bankAccounts?: Array<{
+    bank_name?: string | null;
+    account_number?: string | null;
+    cci?: string | null;
+    account_holder?: string | null;
+    currency?: string | null;
+    account_type?: string | null;
+  }> | null;
+};
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatDate(value: string | null | undefined): string {
+  return fmtDateLima(value);
+}
+
+function formatDateTime(value: string | null | undefined): string {
+  return fmtDateTimeFullLima(value);
+}
+
+function formatMoney(amount: number): string {
+  return Number(amount || 0).toFixed(2);
+}
+
+function resolveGlobalDiscountPercent(
+  metadata: Record<string, unknown>,
+  discountAmount: number,
+  discountableAmount: number,
+): number {
+  const savedPercent = Number(metadata.discount_percent ?? metadata.global_discount_percent);
+  if (Number.isFinite(savedPercent) && savedPercent > 0) {
+    return Math.min(savedPercent, 100);
+  }
+
+  if (discountableAmount <= 0) {
+    return 0;
+  }
+
+  return Math.min(Math.max((discountAmount / discountableAmount) * 100, 0), 100);
+}
+
+function normalizeCurrencyName(currencyCode: string | null | undefined): string {
+  const normalized = String(currencyCode ?? '').trim().toUpperCase();
+  if (normalized === 'USD' || normalized === 'US$' || normalized === '$') {
+    return 'DOLARES';
+  }
+  return 'SOLES';
+}
+
+function numberToSpanishWords(n: number): string {
+  const units = ['', 'uno', 'dos', 'tres', 'cuatro', 'cinco', 'seis', 'siete', 'ocho', 'nueve'];
+  const teens = ['diez', 'once', 'doce', 'trece', 'catorce', 'quince', 'dieciseis', 'diecisiete', 'dieciocho', 'diecinueve'];
+  const tens = ['', '', 'veinte', 'treinta', 'cuarenta', 'cincuenta', 'sesenta', 'setenta', 'ochenta', 'noventa'];
+  const hundreds = ['', 'ciento', 'doscientos', 'trescientos', 'cuatrocientos', 'quinientos', 'seiscientos', 'setecientos', 'ochocientos', 'novecientos'];
+
+  const toHundreds = (value: number): string => {
+    if (value === 0) return '';
+    if (value === 100) return 'cien';
+
+    const c = Math.floor(value / 100);
+    const rem = value % 100;
+    const parts: string[] = [];
+
+    if (c > 0) {
+      parts.push(hundreds[c]);
+    }
+
+    if (rem >= 10 && rem <= 19) {
+      parts.push(teens[rem - 10]);
+    } else {
+      const d = Math.floor(rem / 10);
+      const u = rem % 10;
+
+      if (d === 2 && u > 0) {
+        parts.push(`veinti${units[u]}`);
+      } else {
+        if (d > 0) parts.push(tens[d]);
+        if (u > 0) {
+          if (d > 2) {
+            parts.push(`y ${units[u]}`);
+          } else if (d === 0) {
+            parts.push(units[u]);
+          }
+        }
+      }
+    }
+
+    return parts.join(' ').trim();
+  };
+
+  if (n === 0) return 'cero';
+
+  const millions = Math.floor(n / 1000000);
+  const thousands = Math.floor((n % 1000000) / 1000);
+  const hundredsGroup = n % 1000;
+  const parts: string[] = [];
+
+  if (millions > 0) {
+    if (millions === 1) {
+      parts.push('un millon');
+    } else {
+      parts.push(`${toHundreds(millions)} millones`);
+    }
+  }
+
+  if (thousands > 0) {
+    if (thousands === 1) {
+      parts.push('mil');
+    } else {
+      parts.push(`${toHundreds(thousands)} mil`);
+    }
+  }
+
+  if (hundredsGroup > 0) {
+    parts.push(toHundreds(hundredsGroup));
+  }
+
+  return parts.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function amountToWords(amount: number, currencyCode: string | null | undefined): string {
+  const safeAmount = Number.isFinite(amount) ? Math.max(0, amount) : 0;
+  const integerPart = Math.floor(safeAmount);
+  const decimalPart = Math.round((safeAmount - integerPart) * 100);
+  const decimalText = String(decimalPart).padStart(2, '0');
+  const words = numberToSpanishWords(integerPart).toUpperCase();
+  const currency = normalizeCurrencyName(currencyCode);
+  return `SON: ${words} CON ${decimalText}/100 ${currency}`;
+}
+
+function resolveItemProductCode(item: PrintableSalesItem): string {
+  const itemAny = item as PrintableSalesItem & {
+    product_code?: string | null;
+    metadata?: Record<string, unknown> | null;
+  };
+  const metadata = itemAny.metadata ?? {};
+
+  const candidate = String(
+    itemAny.productCode
+    ?? itemAny.product_code
+    ?? metadata.product_code
+    ?? metadata.productCode
+    ?? metadata.code
+    ?? ''
+  ).trim();
+
+  if (candidate !== '') {
+    return candidate;
+  }
+
+  const productId = Number(item.productId ?? 0);
+  return Number.isFinite(productId) && productId > 0 ? `ID-${productId}` : '';
+}
+
+function normalizePrintAssetUrl(rawUrl: string | null | undefined): string | null {
+  const candidate = String(rawUrl ?? '').trim();
+  if (!candidate) {
+    return null;
+  }
+
+  if (/^https?:\/\//i.test(candidate) || candidate.startsWith('data:')) {
+    return candidate;
+  }
+
+  const base = apiClient.baseUrl.replace(/\/+$/, '');
+  if (candidate.startsWith('//')) {
+    return `http:${candidate}`;
+  }
+
+  if (candidate.startsWith('/')) {
+    return `${base}${candidate}`;
+  }
+
+  return `${base}/${candidate.replace(/^\/+/, '')}`;
+}
+
+function resolvePrintableCompanyProfile(source: PrintableSalesDocument | CashReportPrintData): PrintableCompanyProfile {
+  const metadata = ((source as PrintableSalesDocument).metadata ?? {}) as Record<string, unknown>;
+  const inputCompany = (source.company ?? {}) as Record<string, unknown>;
+
+  const taxId = (
+    inputCompany.taxId
+    ?? inputCompany.tax_id
+    ?? metadata.company_tax_id
+    ?? metadata.tax_id
+    ?? null
+  ) as string | null;
+  const legalName = (
+    inputCompany.legalName
+    ?? inputCompany.legal_name
+    ?? metadata.company_legal_name
+    ?? metadata.legal_name
+    ?? null
+  ) as string | null;
+  const tradeName = (
+    inputCompany.tradeName
+    ?? inputCompany.trade_name
+    ?? metadata.company_trade_name
+    ?? metadata.trade_name
+    ?? null
+  ) as string | null;
+  const address = (
+    inputCompany.address
+    ?? inputCompany.company_address
+    ?? metadata.company_address
+    ?? metadata.address
+    ?? null
+  ) as string | null;
+  const companyDescription = (
+    inputCompany.companyDescription
+    ?? inputCompany.company_description
+    ?? metadata.company_description
+    ?? metadata.companyDescription
+    ?? null
+  ) as string | null;
+  const phone = (
+    inputCompany.phone
+    ?? inputCompany.company_phone
+    ?? metadata.company_phone
+    ?? metadata.phone
+    ?? null
+  ) as string | null;
+  const email = (
+    inputCompany.email
+    ?? inputCompany.company_email
+    ?? metadata.company_email
+    ?? metadata.email
+    ?? null
+  ) as string | null;
+  const logoCandidate = (
+    inputCompany.logoUrl
+    ?? inputCompany.logo_url
+    ?? metadata.company_logo_url
+    ?? metadata.logo_url
+    ?? null
+  ) as string | null;
+  const showPaymentBrandIcons = (
+    inputCompany.showPaymentBrandIcons
+    ?? inputCompany.show_payment_brand_icons
+    ?? metadata.show_payment_brand_icons
+    ?? metadata.company_show_payment_brand_icons
+    ?? true
+  ) as boolean;
+
+  const bankAccounts = (
+    inputCompany.bankAccounts
+    ?? inputCompany.bank_accounts
+    ?? metadata.company_bank_accounts
+    ?? metadata.bank_accounts
+    ?? null
+  ) as PrintableCompanyProfile['bankAccounts'];
+
+  return {
+    taxId,
+    legalName,
+    tradeName,
+    companyDescription,
+    address,
+    phone,
+    email,
+    logoUrl: normalizePrintAssetUrl(logoCandidate),
+    showPaymentBrandIcons,
+    bankAccounts,
+  };
+}
+
+function resolveVehiclePrintData(
+  metadata: Record<string, unknown>,
+  doc?: PrintableSalesDocument,
+): { plate: string; brand: string; model: string; odometer: string; nextOdometer: string } {
+  const plate = String(
+    doc?.metadata?.vehiclePlateSnapshot
+    ?? (doc as unknown as Record<string, unknown> | undefined)?.vehiclePlateSnapshot
+    ?? metadata.vehicle_plate
+    ?? metadata.vehiclePlateSnapshot
+    ?? ''
+  ).trim();
+  const brand = String(
+    (doc as unknown as Record<string, unknown> | undefined)?.vehicleBrandSnapshot
+    ?? metadata.vehicle_brand
+    ?? metadata.vehicleBrand
+    ?? ''
+  ).trim();
+  const model = String(
+    (doc as unknown as Record<string, unknown> | undefined)?.vehicleModelSnapshot
+    ?? metadata.vehicle_model
+    ?? metadata.vehicleModel
+    ?? ''
+  ).trim();
+
+  const odometerDigits = String(metadata.vehicle_odometer_km ?? '').replace(/\D+/g, '');
+  const odometer = odometerDigits !== '' ? `${Number(odometerDigits).toLocaleString('en-US')} km` : '';
+  const nextOdometerDigits = String(metadata.vehicle_next_odometer_km ?? '').replace(/\D+/g, '');
+  const nextOdometer = nextOdometerDigits !== '' ? `${Number(nextOdometerDigits).toLocaleString('en-US')} km` : '';
+
+  return { plate, brand, model, odometer, nextOdometer };
+}
+
+function paymentBrandsFooterHtml(size: 'A4' | '80mm'): string {
+  const baseClass = size === 'A4' ? 'paybrands paybrands-a4' : 'paybrands paybrands-80';
+  const origin = (typeof window !== 'undefined' && window.location?.origin) ? window.location.origin : '';
+  const yapeLogo = `${origin}/assets/payment-logos/yape-official.png`;
+  const plinLogo = `${origin}/assets/payment-logos/plin-official.png`;
+  const culqiLogo = `${origin}/assets/payment-logos/culqi-official.png`;
+  return `<div class="${baseClass}">
+    <div class="paybrand"><img src="${escapeHtml(yapeLogo)}" alt="Yape" /></div>
+    <div class="paybrand"><img src="${escapeHtml(plinLogo)}" alt="Plin" /></div>
+    <div class="paybrand"><img src="${escapeHtml(culqiLogo)}" alt="Culqi" /></div>
+  </div>`;
+}
+
+function normalizePrintableBankAccounts(company: PrintableCompanyProfile): Array<{
+  bankName: string;
+  accountNumber: string;
+  cci: string;
+  accountHolder: string;
+}> {
+  return (company.bankAccounts ?? [])
+    .map((row) => {
+      const bankName = String(row.bank_name ?? '').trim();
+      const accountNumber = String(row.account_number ?? '').trim();
+      const cci = String(row.cci ?? '').trim() || (String(row.account_type ?? '').trim().toUpperCase() === 'CCI' ? accountNumber : '');
+      const accountHolder = String(row.account_holder ?? '').trim() || String(company.tradeName ?? company.legalName ?? '').trim();
+
+      return {
+        bankName,
+        accountNumber,
+        cci,
+        accountHolder,
+      };
+    })
+    .filter((row) => row.bankName !== '' || row.accountNumber !== '' || row.cci !== '' || row.accountHolder !== '');
+}
+
+function companyFooterHtml(company: PrintableCompanyProfile, size: 'A4' | '80mm'): string {
+  const bankRows = normalizePrintableBankAccounts(company);
+  const showPaymentBrands = company.showPaymentBrandIcons !== false;
+  const logoHtml = showPaymentBrands ? paymentBrandsFooterHtml(size) : '';
+
+  if (bankRows.length === 0 && !showPaymentBrands) {
+    return '';
+  }
+
+  const bankBlocks = bankRows.length > 0
+    ? bankRows.map((row) => `
+        <div class="company-footer-bank">
+          <div><strong>${escapeHtml(row.bankName || '-')}</strong></div>
+          ${row.accountNumber ? `<div>Cuenta: ${escapeHtml(row.accountNumber)}</div>` : ''}
+          ${row.cci ? `<div>CCI: ${escapeHtml(row.cci)}</div>` : ''}
+          ${row.accountHolder ? `<div>Titular: ${escapeHtml(row.accountHolder)}</div>` : ''}
+        </div>
+      `).join('')
+    : '';
+
+  if (size === 'A4') {
+    return `<div class="company-footer">
+      ${bankBlocks ? `<div class="company-footer-banks"><div class="company-footer-title">Datos bancarios</div>${bankBlocks}</div>` : ''}
+      ${logoHtml ? `<div class="company-footer-logos">${logoHtml}</div>` : ''}
+    </div>`;
+  }
+
+  return `${bankBlocks ? `<div class="company-footer-banks company-footer-banks--ticket"><div class="company-footer-title">Bancos</div>${bankBlocks}</div>` : ''}${logoHtml ? `<div class="company-footer-logos company-footer-logos--ticket">${logoHtml}</div>` : ''}`;
+}
+
+function baseDocumentKind(kind: string): string {
+  const normalized = String(kind || '').trim().toUpperCase();
+  if (normalized === 'CREDIT_NOTE' || normalized.startsWith('CREDIT_NOTE_')) {
+    return 'CREDIT_NOTE';
+  }
+  if (normalized === 'DEBIT_NOTE' || normalized.startsWith('DEBIT_NOTE_')) {
+    return 'DEBIT_NOTE';
+  }
+  return normalized;
+}
+
+function kindMeta(kind: PrintableSalesDocument['documentKind']): { shortCode: string; title: string } {
+  const baseKind = baseDocumentKind(kind);
+  if (baseKind === 'INVOICE') {
+    return { shortCode: 'F', title: 'FACTURA ELECTRONICA' };
+  }
+  if (baseKind === 'RECEIPT') {
+    return { shortCode: 'B', title: 'BOLETA DE VENTA ELECTRONICA' };
+  }
+  if (baseKind === 'SALES_ORDER') {
+    return { shortCode: 'P', title: 'PEDIDO DE VENTA' };
+  }
+  if (baseKind === 'QUOTATION') {
+    return { shortCode: 'C', title: 'COTIZACION' };
+  }
+  if (baseKind === 'CREDIT_NOTE') {
+    return { shortCode: 'NC', title: 'NOTA DE CREDITO' };
+  }
+
+  return { shortCode: 'ND', title: 'NOTA DE DEBITO' };
+}
+
+function isTributaryKind(kind: PrintableSalesDocument['documentKind']): boolean {
+  const baseKind = baseDocumentKind(kind);
+  return baseKind === 'INVOICE' || baseKind === 'RECEIPT' || baseKind === 'CREDIT_NOTE' || baseKind === 'DEBIT_NOTE';
+}
+
+function isNoteKind(kind: PrintableSalesDocument['documentKind']): boolean {
+  const baseKind = baseDocumentKind(kind);
+  return baseKind === 'CREDIT_NOTE' || baseKind === 'DEBIT_NOTE';
+}
+
+function findMetaStringValue(
+  source: unknown,
+  keys: string[]
+): string | null {
+  if (!source || typeof source !== 'object') {
+    return null;
+  }
+
+  const record = source as Record<string, unknown>;
+  for (const key of keys) {
+    const candidate = record[key];
+    if (typeof candidate === 'string' && candidate.trim() !== '') {
+      return normalizeMetaScalar(candidate);
+    }
+
+    if (candidate && typeof candidate === 'object') {
+      const scalar = extractFirstMetaScalar(candidate);
+      if (scalar !== '') {
+        return scalar;
+      }
+    }
+  }
+
+  for (const value of Object.values(record)) {
+    if (value && typeof value === 'object') {
+      const nested = findMetaStringValue(value, keys);
+      if (nested) {
+        return nested;
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractFirstMetaScalar(value: unknown): string {
+  if (typeof value === 'string') {
+    return normalizeMetaScalar(value);
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+
+  if (value && typeof value === 'object') {
+    for (const nested of Object.values(value as Record<string, unknown>)) {
+      const scalar = extractFirstMetaScalar(nested);
+      if (scalar !== '') {
+        return scalar;
+      }
+    }
+  }
+
+  return '';
+}
+
+function normalizeMetaScalar(value: string): string {
+  const normalized = value.trim();
+  if (normalized === '') {
+    return '';
+  }
+
+  if ((normalized.startsWith('{') && normalized.endsWith('}')) || (normalized.startsWith('[') && normalized.endsWith(']'))) {
+    try {
+      const decoded = JSON.parse(normalized) as unknown;
+      const scalar = extractFirstMetaScalar(decoded);
+      if (scalar !== '') {
+        return scalar;
+      }
+    } catch {
+      return normalized;
+    }
+  }
+
+  return normalized;
+}
+
+function resolveSunatPrintData(metadata: Record<string, unknown>, docKind: PrintableSalesDocument['documentKind']) {
+  if (!isTributaryKind(docKind)) {
+    return { signature: '' };
+  }
+
+  const signature = findMetaStringValue(metadata, [
+    'sunat_electronic_signature',
+    'sunat_signature',
+    'firma_electronica',
+    'firma',
+    'signature',
+    'hash_cpe',
+    'codigo_hash',
+    'digest_value',
+    'digestValue',
+  ]) ?? '';
+
+  return { signature };
+}
+
+function resolveDocumentObservations(doc: PrintableSalesDocument): string {
+  const directNotes = typeof doc.notes === 'string' ? doc.notes.trim() : '';
+  if (directNotes !== '') {
+    return directNotes;
+  }
+
+  return findMetaStringValue((doc.metadata ?? {}) as Record<string, unknown>, [
+    'observations',
+    'observation',
+    'observacion',
+    'observaciones',
+    'notes',
+    'note',
+    'glosa',
+    'comment',
+    'comments',
+  ]) ?? '';
+}
+
+function cashDocumentKindLabel(kind: string): string {
+  const normalized = baseDocumentKind(kind);
+  if (normalized === 'INVOICE') return 'Factura';
+  if (normalized === 'RECEIPT') return 'Boleta';
+  if (normalized === 'SALES_ORDER') return 'Pedido';
+  if (normalized === 'QUOTATION') return 'Cotizacion';
+  if (normalized === 'CREDIT_NOTE') return 'N. Credito';
+  if (normalized === 'DEBIT_NOTE') return 'N. Debito';
+  return normalized || '-';
+}
+
+function resolveNotePrintDetails(doc: PrintableSalesDocument): {
+  sourceDocumentKind: string;
+  sourceDocumentNumber: string;
+  sourceDocumentLabel: string;
+  noteReasonCode: string;
+  noteReasonDescription: string;
+} {
+  const metadata = (doc.metadata ?? {}) as Record<string, unknown>;
+  const sourceDocumentKind = String(metadata.source_document_kind ?? '').trim();
+  const sourceDocumentNumber = String(metadata.source_document_number ?? '').trim();
+  const sourceDocumentLabel = sourceDocumentKind ? cashDocumentKindLabel(sourceDocumentKind) : '-';
+  const noteReasonCode = String(metadata.note_reason_code ?? '').trim();
+  const noteReasonDescription = String(metadata.note_reason_description ?? '').trim();
+
+  return {
+    sourceDocumentKind,
+    sourceDocumentNumber,
+    sourceDocumentLabel,
+    noteReasonCode,
+    noteReasonDescription,
+  };
+}
+
+export function buildCommercialDocumentA4Html(
+  doc: PrintableSalesDocument,
+  options?: { embedded?: boolean; showItemDiscount?: boolean },
+): string {
+  const meta = kindMeta(doc.documentKind);
+  const showTributaryBreakdown = isTributaryKind(doc.documentKind);
+  const isNoteDocument = isNoteKind(doc.documentKind);
+  const isEmbedded = options?.embedded === true;
+  const showItemDiscount = options?.showItemDiscount !== false;
+  const notePrint = resolveNotePrintDetails(doc);
+  const company = resolvePrintableCompanyProfile(doc);
+  const companyTitle = String(company.tradeName || company.legalName || 'SISTEMA FACTURACION').trim() || 'SISTEMA FACTURACION';
+  const companyLegalName = String(company.legalName || companyTitle).trim();
+  const companyDescription = String(company.companyDescription || '').trim();
+  const companyTaxId = String(company.taxId || '00000000000').trim() || '00000000000';
+  const companyAddress = String(company.address || '').trim();
+  const companyPhone = String(company.phone || '').trim();
+  const companyEmail = String(company.email || '').trim();
+  const documentFileName = `${String(doc.series || '').trim()}-${String(doc.number || '').trim()}.pdf`;
+  const logoHtml = company.logoUrl
+    ? `<img src="${escapeHtml(company.logoUrl)}" alt="Logo empresa" class="brand-logo" />`
+    : `<div class="brand-logo brand-logo--placeholder">LOGO</div>`;
+
+  const rows = doc.items
+    .map((item) => {
+      const itemCode = resolveItemProductCode(item);
+      return `
+        <tr>
+          <td class="ta-c">${item.lineNo}</td>
+          <td class="ta-c">${itemCode ? escapeHtml(itemCode) : '-'}</td>
+          <td class="ta-r">${Number(item.qty).toFixed(3)}</td>
+          <td class="ta-c">${escapeHtml(item.unitLabel)}</td>
+          <td>${escapeHtml(item.description)}</td>
+          <td class="ta-r">${doc.currencySymbol} ${formatMoney(item.unitPrice)}</td>
+          ${showItemDiscount ? `<td class="ta-r">${doc.currencySymbol} ${formatMoney(Number(item.discountTotal ?? 0))}</td>` : ''}
+          <td class="ta-r">${doc.currencySymbol} ${formatMoney(item.lineTotal)}</td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  const metaData = (doc.metadata ?? {}) as Record<string, unknown>;
+  const vehiclePrint = resolveVehiclePrintData(metaData, doc);
+  const paymentRows = resolvePaymentPrintRows(doc);
+  const paymentCondition = String(metaData.payment_condition ?? 'CONTADO').toUpperCase() === 'CREDITO' ? 'Crédito' : 'Contado';
+  const itemDiscountTotal = doc.items.reduce((acc, item) => acc + Number(item.discountTotal ?? 0), 0);
+  const globalDiscountTotal = Number(metaData.discount_total ?? metaData.global_discount_total ?? 0);
+  const globalDiscountPercent = resolveGlobalDiscountPercent(
+    metaData,
+    globalDiscountTotal,
+    Math.max(doc.subtotal + doc.taxTotal - itemDiscountTotal, 0),
+  );
+  const sunatOpCode = String(metaData.sunat_operation_type_code ?? '').trim();
+  const sunatOpName = String(metaData.sunat_operation_type_name ?? '').trim();
+  const detraccionAmount = Number(metaData.detraccion_amount ?? 0);
+  const detraccionRate = Number(metaData.detraccion_rate_percent ?? 0);
+  const detraccionType = String(metaData.detraccion_service_name ?? '').trim();
+  const retencionAmount = Number(metaData.retencion_amount ?? 0);
+  const retencionRate = Number(metaData.retencion_rate_percent ?? 0);
+  const retencionType = String(metaData.retencion_type_name ?? '').trim();
+  const percepcionAmount = Number(metaData.percepcion_amount ?? 0);
+  const percepcionRate = Number(metaData.percepcion_rate_percent ?? 0);
+  const percepcionType = String(metaData.percepcion_type_name ?? '').trim();
+  const sunatPrint = resolveSunatPrintData(metaData, doc.documentKind);
+  const observations = resolveDocumentObservations(doc);
+  const totalInWords = amountToWords(Number(doc.grandTotal ?? 0), doc.currencyCode);
+
+  const tributaryRows = showTributaryBreakdown ? [
+    sunatOpCode
+      ? `<tr><td class="label">Tipo Op. SUNAT:</td><td class="value">${escapeHtml(sunatOpCode)}${sunatOpName ? ` - ${escapeHtml(sunatOpName)}` : ''}</td></tr>`
+      : '',
+    detraccionAmount > 0
+      ? `<tr><td class="label">Detraccion${detraccionType ? ` (${escapeHtml(detraccionType)})` : ''}:</td><td class="value">${doc.currencySymbol} ${formatMoney(detraccionAmount)} (${formatMoney(detraccionRate)}%)</td></tr>`
+      : '',
+    retencionAmount > 0
+      ? `<tr><td class="label">Retencion${retencionType ? ` (${escapeHtml(retencionType)})` : ''}:</td><td class="value">${doc.currencySymbol} ${formatMoney(retencionAmount)} (${formatMoney(retencionRate)}%)</td></tr>`
+      : '',
+    percepcionAmount > 0
+      ? `<tr><td class="label">Percepcion${percepcionType ? ` (${escapeHtml(percepcionType)})` : ''}:</td><td class="value">${doc.currencySymbol} ${formatMoney(percepcionAmount)} (${formatMoney(percepcionRate)}%)</td></tr>`
+      : '',
+  ].filter((row) => row !== '').join('') : '';
+
+  return `
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>${escapeHtml(documentFileName)}</title>
+        <style>
+          @page { size: A4 portrait; margin: 9mm; }
+          * { box-sizing: border-box; }
+          body { margin: 0; font-family: "Segoe UI", Tahoma, sans-serif; color: #1f2937; }
+          .print-bar {
+            background: linear-gradient(120deg, #0f172a 0%, #1e3a8a 100%);
+            color: #fff;
+            padding: 10px 14px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 13px;
+          }
+          .print-bar button {
+            background: #ffffff;
+            color: #0f172a;
+            border: 1px solid #cbd5e1;
+            padding: 7px 12px;
+            font-size: 12px;
+            font-weight: 700;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-left: 8px;
+          }
+          .sheet { width: 100%; border: 1.5px solid #1f2937; min-height: 277mm; padding: 8mm; }
+          .head { display: grid; grid-template-columns: 1.5fr 0.75fr; gap: 10px; align-items: stretch; }
+          .brand { border: 1px solid #9ca3af; border-radius: 8px; padding: 10px; }
+          .brand-head { display: flex; gap: 10px; align-items: flex-start; }
+          .brand-logo { width: 170px !important; min-width: 170px; max-width: 170px; height: auto; max-height: 130px; object-fit: contain; border: 1px solid #d1d5db; border-radius: 8px; background: #fff; flex-shrink: 0; }
+          .brand-logo--placeholder { display: inline-flex; align-items: center; justify-content: center; font-size: 12px; color: #64748b; font-weight: 700; letter-spacing: 0.4px; }
+          .brand h1 { margin: 0; font-size: 20px; letter-spacing: 0.4px; line-height: 1.15; }
+          .brand-copy { margin-top: 0; }
+          .brand p { margin: 2px 0; font-size: 11px; color: #4b5563; }
+          .brand-description { margin: 4px 0 2px; font-size: 11px; line-height: 1.25; color: #1f2937; }
+          .voucher { border: 1px solid #9ca3af; border-radius: 8px; padding: 10px; text-align: center; }
+          .voucher .ruc { font-size: 34px; font-weight: 700; letter-spacing: 1px; }
+          .voucher .title { font-size: 18px; margin-top: 4px; letter-spacing: 2px; }
+          .voucher .docno { margin-top: 10px; font-size: 22px; font-weight: 700; }
+          .party { margin-top: 10px; border: 1px solid #9ca3af; border-radius: 8px; padding: 8px 10px; font-size: 12px; display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; }
+          .note-box { margin-top: 10px; border: 1px solid #9ca3af; border-radius: 8px; padding: 8px 10px; font-size: 12px; background: #f8fafc; }
+          .note-box h4 { margin: 0 0 6px 0; font-size: 13px; }
+          .kv { margin: 2px 0; }
+          .kv b { display: inline-block; min-width: 118px; }
+          .table-wrap { margin-top: 10px; }
+          table { width: 100%; border-collapse: collapse; }
+          th { background: #60a5fa; color: #0f172a; font-size: 11px; text-transform: uppercase; letter-spacing: 0.2px; padding: 5px 6px; border-bottom: 1px solid #1f2937; }
+          td { border-bottom: 1px solid #d1d5db; font-size: 11px; padding: 5px 6px; vertical-align: top; }
+          .ta-r { text-align: right; }
+          .ta-c { text-align: center; }
+          .summary { margin-top: 8px; display: grid; grid-template-columns: 1fr 280px; gap: 10px; }
+          .amounts table td { border-bottom: 1px solid #d1d5db; }
+          .amounts .label { text-align: right; color: #4b5563; width: 65%; }
+          .amounts .value { text-align: right; width: 35%; }
+          .total-row td { font-weight: 700; border-top: 1px solid #1f2937; }
+          .payment { margin-top: 8px; font-size: 12px; font-weight: 600; }
+          .obs { margin-top: 12px; border-top: 1px solid #9ca3af; padding-top: 6px; font-size: 11px; color: #4b5563; }
+          .sunat-proof { margin-top: 10px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px; }
+          .sunat-proof h5 { margin: 0 0 4px 0; font-size: 12px; }
+          .sunat-proof p { margin: 0 0 4px 0; font-size: 11px; color: #334155; word-break: break-all; }
+          .paybrands { display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 10px; }
+          .paybrand { border-radius: 8px; border: 1px solid #d1d5db; background: #fff; padding: 5px 10px; height: 40px; display: inline-flex; align-items: center; }
+          .paybrand img { height: 28px; width: auto; display: block; }
+          .company-footer { margin-top: 10px; display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; }
+          .company-footer-banks { text-align: left; font-size: 11px; line-height: 1.4; color: #334155; }
+          .company-footer-banks--ticket { font-size: 8px; margin-top: 1mm; }
+          .company-footer-title { font-weight: 700; color: #0f172a; margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.2px; }
+          .company-footer-bank { margin-top: 4px; }
+          .company-footer-bank div { margin: 0; }
+          .company-footer-logos { display: flex; justify-content: flex-end; }
+          .company-footer-logos--ticket { justify-content: center; margin-top: 1mm; }
+        </style>
+      </head>
+      <body>
+        ${isEmbedded
+          ? ''
+          : `<div class="print-bar no-print">
+          <span>Vista Previa - Documento A4</span>
+          <div>
+            <button onclick="window.print()">Imprimir</button>
+            <button onclick="window.close()">Cerrar</button>
+          </div>
+        </div>`}
+        <section class="sheet">
+          <section class="head">
+            <article class="brand">
+              <div class="brand-head">
+                ${logoHtml}
+                <div class="brand-copy">
+                  <h1>${escapeHtml(companyTitle)}</h1>
+                  ${companyLegalName !== companyTitle ? `<p>${escapeHtml(companyLegalName)}</p>` : ''}
+                  ${companyDescription ? `<p class="brand-description">${escapeHtml(companyDescription)}</p>` : ''}
+                  ${companyAddress ? `<p>${escapeHtml(companyAddress)}</p>` : ''}
+                  ${companyPhone ? `<p>Tel: ${escapeHtml(companyPhone)}</p>` : ''}
+                  ${companyEmail ? `<p>Email: ${escapeHtml(companyEmail)}</p>` : ''}
+                </div>
+              </div>
+              <p>Fecha emision: ${formatDateTime(doc.issueDate)}</p>
+            </article>
+            <article class="voucher">
+              <div class="ruc">R.U.C.: ${escapeHtml(companyTaxId)}</div>
+              <div class="title">${escapeHtml(meta.title)}</div>
+              <div class="docno">No.: ${escapeHtml(doc.series)}-${doc.number}</div>
+            </article>
+          </section>
+
+          <section class="party">
+            <article>
+              <p class="kv"><b>Razon Social:</b> ${escapeHtml(doc.customerName || '-')}</p>
+              <p class="kv"><b>Direccion:</b> ${escapeHtml(doc.customerAddress || '-')}</p>
+              ${vehiclePrint.plate ? `<p class="kv"><b>Vehiculo:</b> ${escapeHtml(vehiclePrint.plate)}${vehiclePrint.brand || vehiclePrint.model ? ` (${escapeHtml([vehiclePrint.brand, vehiclePrint.model].filter((x) => x !== '').join(' '))})` : ''}</p>` : ''}
+              ${vehiclePrint.odometer ? `<p class="kv"><b>Kilometraje:</b> ${escapeHtml(vehiclePrint.odometer)}</p>` : ''}
+              ${vehiclePrint.nextOdometer ? `<p class="kv"><b>Prox. Kilometraje:</b> ${escapeHtml(vehiclePrint.nextOdometer)}</p>` : ''}
+              <p class="kv"><b>Fecha Emision:</b> ${formatDateTime(doc.issueDate)}</p>
+              <p class="kv"><b>Tipo Moneda:</b> ${escapeHtml(doc.currencyCode)}</p>
+            </article>
+            <article>
+              <p class="kv"><b>Documento:</b> ${escapeHtml(doc.customerDocNumber || '-')}</p>
+              <p class="kv"><b>Fecha Venc.:</b> ${formatDate(doc.dueDate)}</p>
+              <p class="kv"><b>Condición de pago:</b> ${paymentCondition}</p>
+              ${paymentRows.map((payment) => `<p class="kv"><b>${paymentRows.length > 1 ? 'Método de pago' : 'Método de pago'}:</b> ${escapeHtml(payment.method)} · ${doc.currencySymbol} ${formatMoney(payment.amount)}</p>`).join('')}
+              <p class="kv"><b>Ref:</b> ${doc.id}</p>
+            </article>
+          </section>
+
+          ${isNoteDocument
+            ? `<section class="note-box">
+                <h4>Datos de la nota</h4>
+                <p class="kv"><b>Documento afectado:</b> ${escapeHtml(notePrint.sourceDocumentLabel)} ${escapeHtml(notePrint.sourceDocumentNumber || '-')}</p>
+                <p class="kv"><b>Tipo de nota:</b> ${escapeHtml(notePrint.noteReasonCode || '-')} ${notePrint.noteReasonDescription ? `- ${escapeHtml(notePrint.noteReasonDescription)}` : ''}</p>
+                <p class="kv"><b>Detalle:</b> La presente nota modifica el comprobante afectado y detalla los productos/items involucrados a continuación.</p>
+              </section>`
+            : ''}
+
+          <section class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:44px">#</th>
+                  <th style="width:98px">Codigo</th>
+                  <th style="width:76px">Cantidad</th>
+                  <th style="width:86px">Unid. Med.</th>
+                  <th>${isNoteDocument ? 'Productos / conceptos afectados' : 'Descripcion'}</th>
+                  <th style="width:92px">Valor U.</th>
+                  ${showItemDiscount ? '<th style="width:96px">Descuento</th>' : ''}
+                  <th style="width:96px">Valor Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rows || `<tr><td colspan="${showItemDiscount ? '8' : '7'}" class="ta-c">Sin items</td></tr>`}
+              </tbody>
+            </table>
+          </section>
+
+          <section class="summary">
+            <article>
+              <p class="payment">CONDICIÓN DE PAGO: ${paymentCondition}</p>
+              ${paymentRows.map((payment) => `<p class="payment">${escapeHtml(payment.method)}: ${doc.currencySymbol} ${formatMoney(payment.amount)}</p>`).join('')}
+              <p class="payment">${escapeHtml(totalInWords)}</p>
+            </article>
+            <article class="amounts">
+              <table>
+                <tbody>
+                  ${showTributaryBreakdown && doc.gravadaTotal > 0 ? `<tr><td class="label">Op. Gravadas:</td><td class="value">${doc.currencySymbol} ${formatMoney(doc.gravadaTotal)}</td></tr>` : ''}
+                  ${showTributaryBreakdown && doc.inafectaTotal > 0 ? `<tr><td class="label">Op. Inafectas:</td><td class="value">${doc.currencySymbol} ${formatMoney(doc.inafectaTotal)}</td></tr>` : ''}
+                  ${showTributaryBreakdown && doc.exoneradaTotal > 0 ? `<tr><td class="label">Op. Exoneradas:</td><td class="value">${doc.currencySymbol} ${formatMoney(doc.exoneradaTotal)}</td></tr>` : ''}
+                  ${showTributaryBreakdown && doc.taxTotal > 0 ? `<tr><td class="label">IGV:</td><td class="value">${doc.currencySymbol} ${formatMoney(doc.taxTotal)}</td></tr>` : ''}
+                  ${showItemDiscount && itemDiscountTotal > 0 ? `<tr><td class="label">Descuento por item:</td><td class="value">-${doc.currencySymbol} ${formatMoney(itemDiscountTotal)}</td></tr>` : ''}
+                  ${globalDiscountTotal > 0 ? `<tr><td class="label">Descuento global (${formatMoney(globalDiscountPercent)}%):</td><td class="value">-${doc.currencySymbol} ${formatMoney(globalDiscountTotal)}</td></tr>` : ''}
+                  ${tributaryRows}
+                  <tr class="total-row"><td class="label">Total a Pagar:</td><td class="value">${doc.currencySymbol} ${formatMoney(doc.grandTotal)}</td></tr>
+                </tbody>
+              </table>
+            </article>
+          </section>
+
+          ${sunatPrint.signature
+            ? `<section class="sunat-proof">
+                <div>
+                  <h5>Datos SUNAT</h5>
+                  ${sunatPrint.signature ? `<p><strong>Firma electronica:</strong> ${escapeHtml(sunatPrint.signature)}</p>` : ''}
+                </div>
+              </section>`
+            : ''}
+
+          <section class="obs">
+            <div class="company-footer-note">Observaciones: ${escapeHtml(observations || 'Sin observaciones registradas.')}</div>
+            ${companyFooterHtml(company, 'A4')}
+          </section>
+        </section>
+      </body>
+    </html>
+  `;
+}
+
+export function buildCommercialDocument80mmHtml(
+  doc: PrintableSalesDocument,
+  options?: { embedded?: boolean; showItemDiscount?: boolean },
+): string {
+  const meta = kindMeta(doc.documentKind);
+  const showTributaryBreakdown = isTributaryKind(doc.documentKind);
+  const isNoteDocument = isNoteKind(doc.documentKind);
+  const isEmbedded = options?.embedded === true;
+  const showItemDiscount = options?.showItemDiscount !== false;
+  const notePrint = resolveNotePrintDetails(doc);
+  const company = resolvePrintableCompanyProfile(doc);
+  const companyTitle = String(company.tradeName || company.legalName || 'SISTEMA FACTURACION').trim() || 'SISTEMA FACTURACION';
+  const companyTaxId = String(company.taxId || '').trim();
+  const companyAddress = String(company.address || '').trim();
+  const companyPhone = String(company.phone || '').trim();
+  const companyEmail = String(company.email || '').trim();
+  const documentFileName = `${String(doc.series || '').trim()}-${String(doc.number || '').trim()}.pdf`;
+
+  const itemsRows = doc.items
+    .map((item) => {
+      const qtyStr = Number(item.qty).toFixed(2);
+      const priceStr = formatMoney(item.unitPrice);
+      const totalStr = formatMoney(item.lineTotal);
+      const itemCode = resolveItemProductCode(item);
+      
+      // Ajustar descripción para 80mm (aprox. 32 caracteres por línea)
+      const maxDescLength = 32;
+      const desc = escapeHtml(item.description).substring(0, maxDescLength);
+      const codeRow = itemCode ? `<div class="item-code">Cod: ${escapeHtml(itemCode)}</div>` : '';
+      
+      return `<tr class="item-desc-row">
+        <td class="item-desc">${codeRow}${desc}</td>
+      </tr>
+      <tr class="item-price-row">
+        <td class="item-price-cell">
+          <div class="item-price-wrap">
+            <span class="item-price-unit">${qtyStr} x ${doc.currencySymbol} ${priceStr}</span>
+            <span class="item-price-total">${doc.currencySymbol} ${totalStr}</span>
+          </div>
+        </td>
+      </tr>`;
+    })
+    .join('');
+
+  const itemDiscountTotal = doc.items.reduce((acc, item) => acc + Number(item.discountTotal ?? 0), 0);
+  const metaData = (doc.metadata ?? {}) as Record<string, unknown>;
+  const paymentRows = resolvePaymentPrintRows(doc);
+  const paymentCondition = String(metaData.payment_condition ?? 'CONTADO').toUpperCase() === 'CREDITO' ? 'Crédito' : 'Contado';
+  const vehiclePrint = resolveVehiclePrintData(metaData, doc);
+  const globalDiscountTotal = Number(metaData.discount_total ?? metaData.global_discount_total ?? 0);
+  const globalDiscountPercent = resolveGlobalDiscountPercent(
+    metaData,
+    globalDiscountTotal,
+    Math.max(doc.subtotal + doc.taxTotal - itemDiscountTotal, 0),
+  );
+  const sunatOpCode = String(metaData.sunat_operation_type_code ?? '').trim();
+  const sunatOpName = String(metaData.sunat_operation_type_name ?? '').trim();
+  const detraccionAmount = Number(metaData.detraccion_amount ?? 0);
+  const detraccionRate = Number(metaData.detraccion_rate_percent ?? 0);
+  const retencionAmount = Number(metaData.retencion_amount ?? 0);
+  const retencionRate = Number(metaData.retencion_rate_percent ?? 0);
+  const percepcionAmount = Number(metaData.percepcion_amount ?? 0);
+  const percepcionRate = Number(metaData.percepcion_rate_percent ?? 0);
+  const observations = resolveDocumentObservations(doc);
+  const sunatPrint = resolveSunatPrintData(metaData, doc.documentKind);
+  const totalInWords = amountToWords(Number(doc.grandTotal ?? 0), doc.currencyCode);
+
+  return `
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>${escapeHtml(documentFileName)}</title>
+        <style>
+          @media print { 
+            @page { 
+              size: 80mm auto; 
+              margin: 0; 
+              padding: 0;
+            } 
+            .no-print { 
+              display: none !important; 
+            }
+            body {
+              margin: 0;
+              padding: 0;
+            }
+          }
+          * { 
+            box-sizing: border-box; 
+            margin: 0;
+            padding: 0;
+          }
+          body { 
+            font-family: 'Courier New', Courier, monospace; 
+            color: #000; 
+            font-size: 14px; 
+            line-height: 1.4;
+            background: #fff;
+            width: 80mm;
+            margin: 0 auto;
+          }
+          body, body * {
+            font-weight: 700;
+          }
+          .sheet { 
+            width: 80mm;
+            margin: 0;
+            padding: 2mm 3mm;
+            min-height: 100%;
+          }
+          .print-bar { 
+            background: linear-gradient(120deg, #0f172a 0%, #1e3a8a 100%);
+            color: #fff; 
+            padding: 6px 8px;
+            text-align: center; 
+            font-family: sans-serif; 
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 8px;
+            border-radius: 8px;
+            white-space: nowrap;
+          }
+          .print-bar-title { font-weight: 700; letter-spacing: 0.2px; font-size: 11px; }
+          .print-bar button { 
+            background: #fff;
+            color: #0f172a;
+            border: 1px solid #cbd5e1;
+            padding: 4px 10px; 
+            font-size: 10px;
+            font-weight: 700; 
+            border-radius: 8px; 
+            cursor: pointer;
+          }
+          .divider {
+            border-top: 1px dashed #000;
+            margin: 2mm 0;
+            opacity: 0.6;
+          }
+          .header { 
+            text-align: center;
+            margin-bottom: 2mm;
+          }
+          .header-logo-wrap {
+            display: block;
+            text-align: center;
+            width: 100%;
+            margin: 0 auto 1.2mm;
+          }
+          .header-logo-frame {
+            position: relative;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 36mm;
+            height: 22mm;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+          }
+          .header-logo {
+            max-width: 36mm;
+            width: auto;
+            height: auto;
+            max-height: 22mm;
+            object-fit: contain;
+            object-position: center center;
+            margin: 0 auto;
+            display: block;
+            background: transparent;
+          }
+          .title { 
+            font-size: 13px; 
+            font-weight: 700; 
+            text-transform: uppercase; 
+            letter-spacing: 0.5px;
+            margin-bottom: 1mm;
+          }
+          .docno { 
+            font-size: 15px; 
+            font-weight: 700; 
+            margin-bottom: 0.5mm;
+            letter-spacing: 1px;
+          }
+          .date { 
+            font-size: 11px;
+            color: #333;
+            font-weight: 800;
+          }
+          .section { 
+            margin-bottom: 2mm;
+          }
+          .section-title { 
+            font-weight: 700; 
+            text-transform: uppercase; 
+            font-size: 11px;
+            margin-bottom: 1mm;
+            border-bottom: 1px solid #000;
+            padding-bottom: 0.5mm;
+          }
+          .info-row { 
+            display: flex; 
+            justify-content: space-between; 
+            font-size: 11px; 
+            margin: 0.4mm 0; 
+            word-break: break-word;
+          }
+          .info-label { 
+            font-weight: 800;
+            flex: 0 0 auto;
+            margin-right: 2mm;
+          }
+          .info-value { 
+            flex: 1;
+            text-align: right;
+            font-weight: 800;
+          }
+          .items { 
+            margin-bottom: 2mm;
+            border-top: 1px solid #000;
+            border-bottom: 1px solid #000;
+            padding: 1mm 0;
+          }
+          .item-desc-row td {
+            padding-top: 1.1mm;
+            padding-bottom: 0.5mm;
+          }
+          .item-desc {
+            font-size: 12px;
+            line-height: 1.25;
+            letter-spacing: 0.1px;
+            word-break: break-word;
+          }
+          .item-code {
+            font-size: 10px;
+            line-height: 1.2;
+            letter-spacing: 0.1px;
+            font-weight: 800;
+            margin-bottom: 0.35mm;
+          }
+          .item-price-row td {
+            padding-top: 0.2mm;
+            padding-bottom: 1.1mm;
+          }
+          .item-price-cell {
+            font-size: 12px;
+          }
+          .item-price-wrap {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 2mm;
+          }
+          .item-price-unit {
+            font-size: 12px;
+            line-height: 1.2;
+          }
+          .item-price-total {
+            font-size: 13px;
+            line-height: 1.2;
+            font-weight: 800;
+            letter-spacing: 0.2px;
+            white-space: nowrap;
+          }
+          table {
+            width: 100%;
+            border-collapse: collapse;
+          }
+          td {
+            padding: 0.5mm 0;
+            font-size: 11px;
+          }
+          .summary { 
+            border-top: 1px solid #000;
+            padding-top: 1mm;
+            margin-top: 1mm;
+          }
+          .summary-row { 
+            display: flex; 
+            justify-content: space-between; 
+            font-size: 11px; 
+            margin: 0.5mm 0;
+          }
+          .summary-label { 
+            flex: 1; 
+            font-weight: 800;
+          }
+          .summary-value { 
+            text-align: right;
+            font-weight: 800;
+            flex: 0 0 auto;
+            width: 30mm;
+          }
+          .total-row { 
+            font-size: 14px; 
+            font-weight: 700;
+            border-top: 2px solid #000;
+            padding-top: 1mm;
+            margin-top: 1mm;
+            display: flex;
+            justify-content: space-between;
+          }
+          .footer { 
+            text-align: center; 
+            font-size: 10px; 
+            color: #555; 
+            margin-top: 2mm;
+            border-top: 1px dashed #000;
+            padding-top: 1mm;
+            line-height: 1.2;
+            font-weight: 800;
+          }
+          .company-footer-title { font-weight: 800; text-transform: uppercase; margin-bottom: 1mm; }
+          .company-footer-banks { text-align: left; margin-top: 1mm; font-size: 12px; line-height: 1.35; }
+          .company-footer-bank { margin: 0.4mm 0; font-weight: 800; }
+          .paybrands { display: flex; gap: 5px; align-items: center; justify-content: center; margin: 1.2mm 0; }
+          .paybrand { border-radius: 6px; border: 1px solid #d1d5db; background: #fff; padding: 3px 6px; height: 28px; display: inline-flex; align-items: center; }
+          .paybrand img { height: 20px; width: auto; display: block; }
+          .footer-item {
+            margin: 0.3mm 0;
+          }
+          .sunat-ticket {
+            margin-top: 1.5mm;
+            border-top: 1px dashed #000;
+            padding-top: 1.2mm;
+            text-align: left;
+          }
+          .sunat-ticket img {
+            width: 28mm;
+            height: 28mm;
+            border: 1px solid #000;
+            display: block;
+            margin: 0 auto 1mm;
+            background: #fff;
+          }
+          .sunat-ticket .line {
+            font-size: 9px;
+            margin: 0.3mm 0;
+            word-break: break-all;
+          }
+          .sunat-ticket .line--wrap {
+            white-space: pre-wrap;
+            word-break: break-word;
+          }
+        </style>
+      </head>
+      <body>
+        ${isEmbedded
+          ? ''
+          : `<div class="print-bar no-print">
+          <span class="print-bar-title">Vista Ticket 80mm</span>
+          <div>
+            <button onclick="window.print()">Imprimir</button>
+            <button onclick="window.close()">Cerrar</button>
+          </div>
+        </div>`}
+        
+        <div class="sheet">
+          <div class="header">
+            ${company.logoUrl ? `<div class="header-logo-wrap"><div class="header-logo-frame"><img src="${escapeHtml(company.logoUrl)}" alt="Logo" class="header-logo" data-autocrop="1" /></div></div>` : ''}
+            <div class="title">${escapeHtml(companyTitle)}</div>
+            ${companyTaxId ? `<div class="date">RUC: ${escapeHtml(companyTaxId)}</div>` : ''}
+            ${companyAddress ? `<div class="date">${escapeHtml(companyAddress)}</div>` : ''}
+            ${companyPhone ? `<div class="date">Tel: ${escapeHtml(companyPhone)}</div>` : ''}
+            ${companyEmail ? `<div class="date">Email: ${escapeHtml(companyEmail)}</div>` : ''}
+            <div class="title">${escapeHtml(meta.title)}</div>
+            <div class="docno">${escapeHtml(doc.series)}-${String(doc.number).padStart(6, '0')}</div>
+            <div class="date">${formatDateTime(doc.issueDate)}</div>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="section">
+            <div class="info-row">
+              <div class="info-label">CLIENTE:</div>
+              <div class="info-value">${escapeHtml(doc.customerName || '-')}</div>
+            </div>
+            ${doc.customerDocNumber ? `<div class="info-row">
+              <div class="info-label">Doc:</div>
+              <div class="info-value">${escapeHtml(doc.customerDocNumber)}</div>
+            </div>` : ''}
+            ${vehiclePrint.plate ? `<div class="info-row">
+              <div class="info-label">Vehículo:</div>
+              <div class="info-value">${escapeHtml(vehiclePrint.plate)}${vehiclePrint.brand || vehiclePrint.model ? ` (${escapeHtml([vehiclePrint.brand, vehiclePrint.model].filter((x) => x !== '').join(' '))})` : ''}</div>
+            </div>` : ''}
+            ${vehiclePrint.odometer ? `<div class="info-row">
+              <div class="info-label">Kilometraje:</div>
+              <div class="info-value">${escapeHtml(vehiclePrint.odometer)}</div>
+            </div>` : ''}
+            ${vehiclePrint.nextOdometer ? `<div class="info-row">
+              <div class="info-label">Prox. Km:</div>
+              <div class="info-value">${escapeHtml(vehiclePrint.nextOdometer)}</div>
+            </div>` : ''}
+          </div>
+
+          ${isNoteDocument ? `<div class="divider"></div>
+          <div class="section">
+            <div class="section-title">DATOS DE LA NOTA</div>
+            <div class="info-row">
+              <div class="info-label">Afecta:</div>
+              <div class="info-value">${escapeHtml(notePrint.sourceDocumentLabel)} ${escapeHtml(notePrint.sourceDocumentNumber || '-')}</div>
+            </div>
+            <div class="info-row">
+              <div class="info-label">Motivo:</div>
+              <div class="info-value">${escapeHtml(notePrint.noteReasonCode || '-')} ${notePrint.noteReasonDescription ? `- ${escapeHtml(notePrint.noteReasonDescription)}` : ''}</div>
+            </div>
+          </div>` : ''}
+
+          <div class="divider"></div>
+
+          <div class="items">
+            ${isNoteDocument ? `<div class="section-title" style="margin-bottom:1mm">DETALLE AFECTADO</div>` : ''}
+            <table>
+              <tbody>
+                ${itemsRows || '<tr><td style="text-align:center">Sin items</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+
+          <div class="summary">
+            ${showTributaryBreakdown && doc.gravadaTotal > 0 ? `<div class="summary-row">
+              <div class="summary-label">Op. Gravada:</div>
+              <div class="summary-value">${doc.currencySymbol} ${formatMoney(doc.gravadaTotal)}</div>
+            </div>` : ''}
+            ${showTributaryBreakdown && doc.inafectaTotal > 0 ? `<div class="summary-row">
+              <div class="summary-label">Op. Inafecta:</div>
+              <div class="summary-value">${doc.currencySymbol} ${formatMoney(doc.inafectaTotal)}</div>
+            </div>` : ''}
+            ${showTributaryBreakdown && doc.exoneradaTotal > 0 ? `<div class="summary-row">
+              <div class="summary-label">Op. Exonerada:</div>
+              <div class="summary-value">${doc.currencySymbol} ${formatMoney(doc.exoneradaTotal)}</div>
+            </div>` : ''}
+            ${showTributaryBreakdown && doc.taxTotal > 0 ? `<div class="summary-row">
+              <div class="summary-label">IGV:</div>
+              <div class="summary-value">${doc.currencySymbol} ${formatMoney(doc.taxTotal)}</div>
+            </div>` : ''}
+            ${showItemDiscount && itemDiscountTotal > 0 ? `<div class="summary-row"><div class="summary-label">Dscto. item:</div><div class="summary-value">-${doc.currencySymbol} ${formatMoney(itemDiscountTotal)}</div></div>` : ''}
+            ${globalDiscountTotal > 0 ? `<div class="summary-row"><div class="summary-label">Dscto. global (${formatMoney(globalDiscountPercent)}%):</div><div class="summary-value">-${doc.currencySymbol} ${formatMoney(globalDiscountTotal)}</div></div>` : ''}
+            ${showTributaryBreakdown && sunatOpCode ? `<div class="summary-row"><div class="summary-label">Op. SUNAT:</div><div class="summary-value">${escapeHtml(sunatOpCode)}${sunatOpName ? ` - ${escapeHtml(sunatOpName)}` : ''}</div></div>` : ''}
+            ${showTributaryBreakdown && detraccionAmount > 0 ? `<div class="summary-row"><div class="summary-label">Detraccion:</div><div class="summary-value">${doc.currencySymbol} ${formatMoney(detraccionAmount)} (${formatMoney(detraccionRate)}%)</div></div>` : ''}
+            ${showTributaryBreakdown && retencionAmount > 0 ? `<div class="summary-row"><div class="summary-label">Retencion:</div><div class="summary-value">${doc.currencySymbol} ${formatMoney(retencionAmount)} (${formatMoney(retencionRate)}%)</div></div>` : ''}
+            ${showTributaryBreakdown && percepcionAmount > 0 ? `<div class="summary-row"><div class="summary-label">Percepcion:</div><div class="summary-value">${doc.currencySymbol} ${formatMoney(percepcionAmount)} (${formatMoney(percepcionRate)}%)</div></div>` : ''}
+            <div class="total-row">
+              <span>TOTAL</span>
+              <span>${doc.currencySymbol} ${formatMoney(doc.grandTotal)}</span>
+            </div>
+            <div class="summary-row">
+              <div class="summary-label">SON:</div>
+              <div class="summary-value">${escapeHtml(totalInWords.replace(/^SON:\s*/i, ''))}</div>
+            </div>
+          </div>
+
+          <div class="footer">
+            <div class="footer-item">Condición de pago: ${paymentCondition}</div>
+            ${paymentRows.map((payment) => `<div class="footer-item">${escapeHtml(payment.method)}: ${doc.currencySymbol} ${formatMoney(payment.amount)}</div>`).join('')}
+            ${(sunatPrint.signature || observations)
+              ? `<div class="sunat-ticket">
+                  ${sunatPrint.signature ? `<div class="line"><strong>Firma:</strong> ${escapeHtml(sunatPrint.signature)}</div>` : ''}
+                  ${observations ? `<div class="line line--wrap"><strong>Observaciones:</strong> ${escapeHtml(observations)}</div>` : ''}
+                </div>`
+              : ''}
+            <div class="divider" style="margin: 1mm 0"></div>
+            ${companyFooterHtml(company, '80mm')}
+            <div class="footer-item">Gracias por su compra</div>
+            <div class="footer-item">ID: ${doc.id}</div>
+          </div>
+        </div>
+        <script>
+          (function () {
+            function loadImage(url) {
+              return new Promise(function (resolve, reject) {
+                var image = new Image();
+                image.crossOrigin = 'anonymous';
+                image.onload = function () { resolve(image); };
+                image.onerror = function () { reject(new Error('image-load-failed')); };
+                image.src = url;
+              });
+            }
+
+            function detectBounds(data, width, height) {
+              var minX = width;
+              var minY = height;
+              var maxX = -1;
+              var maxY = -1;
+
+              for (var y = 0; y < height; y++) {
+                for (var x = 0; x < width; x++) {
+                  var idx = (y * width + x) * 4;
+                  var r = data[idx];
+                  var g = data[idx + 1];
+                  var b = data[idx + 2];
+                  var a = data[idx + 3];
+                  var isOpaque = a > 10;
+                  var isNotNearWhite = r < 245 || g < 245 || b < 245;
+                  if (!isOpaque && !isNotNearWhite) {
+                    continue;
+                  }
+                  if (x < minX) minX = x;
+                  if (x > maxX) maxX = x;
+                  if (y < minY) minY = y;
+                  if (y > maxY) maxY = y;
+                }
+              }
+
+              if (maxX < minX || maxY < minY) {
+                return null;
+              }
+
+              return { minX: minX, minY: minY, maxX: maxX, maxY: maxY };
+            }
+
+            function clamp(value, min, max) {
+              return Math.max(min, Math.min(max, value));
+            }
+
+            async function autocropLogo(img) {
+              var src = img.getAttribute('src');
+              if (!src) {
+                return;
+              }
+
+              try {
+                var loaded = await loadImage(src);
+                var width = loaded.naturalWidth || loaded.width;
+                var height = loaded.naturalHeight || loaded.height;
+                if (!width || !height) {
+                  return;
+                }
+
+                var canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                var ctx = canvas.getContext('2d');
+                if (!ctx) {
+                  return;
+                }
+
+                ctx.drawImage(loaded, 0, 0, width, height);
+
+                var imageData;
+                try {
+                  imageData = ctx.getImageData(0, 0, width, height);
+                } catch (_err) {
+                  return;
+                }
+
+                var bounds = detectBounds(imageData.data, width, height);
+                if (!bounds) {
+                  return;
+                }
+
+                var pad = 2;
+                var cropX = clamp(bounds.minX - pad, 0, width - 1);
+                var cropY = clamp(bounds.minY - pad, 0, height - 1);
+                var cropW = clamp(bounds.maxX - bounds.minX + 1 + pad * 2, 1, width - cropX);
+                var cropH = clamp(bounds.maxY - bounds.minY + 1 + pad * 2, 1, height - cropY);
+
+                if (cropX === 0 && cropY === 0 && cropW === width && cropH === height) {
+                  return;
+                }
+
+                var out = document.createElement('canvas');
+                out.width = cropW;
+                out.height = cropH;
+                var outCtx = out.getContext('2d');
+                if (!outCtx) {
+                  return;
+                }
+
+                outCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+                img.src = out.toDataURL('image/png');
+              } catch (_error) {
+                // Ignore autocrop failures to preserve original logo rendering.
+              }
+            }
+
+            function runAutocrop() {
+              var logos = Array.prototype.slice.call(document.querySelectorAll('img.header-logo[data-autocrop="1"]'));
+              logos.forEach(function (logo) {
+                void autocropLogo(logo);
+              });
+            }
+
+            if (document.readyState === 'complete' || document.readyState === 'interactive') {
+              runAutocrop();
+            } else {
+              document.addEventListener('DOMContentLoaded', runAutocrop, { once: true });
+            }
+          })();
+        </script>
+      </body>
+    </html>
+  `;
+}
+
+export function openCommercialDocumentPrintA4(doc: PrintableSalesDocument): void {
+  const printWindow = window.open('', '_blank', 'width=1024,height=920');
+  if (!printWindow) {
+    return;
+  }
+
+  const html = buildCommercialDocumentA4Html(doc);
+  printWindow.document.open();
+  printWindow.document.write(html);
+  printWindow.document.close();
+
+  const trigger = () => {
+    printWindow.focus();
+    printWindow.print();
+  };
+
+  if (printWindow.document.readyState === 'complete') {
+    trigger();
+  } else {
+    printWindow.onload = trigger;
+  }
+}
+
+export function openCommercialDocumentPreview80mm(doc: PrintableSalesDocument): void {
+  const previewWindow = window.open('', '_blank', 'width=420,height=800');
+  if (!previewWindow) {
+    return;
+  }
+
+  const html = buildCommercialDocument80mmHtml(doc);
+  previewWindow.document.open();
+  previewWindow.document.write(html);
+  previewWindow.document.close();
+
+  if (previewWindow.document.readyState === 'complete') {
+    previewWindow.focus();
+  } else {
+    previewWindow.onload = () => {
+      previewWindow.focus();
+    };
+  }
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Cash Report Print Functions
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+export type PaymentMethodBreakdown = {
+  payment_method_id: number;
+  payment_method_code: string;
+  payment_method_name: string;
+  document_count: number;
+  total_amount: number;
+};
+
+export type CashReportDocumentItem = {
+  product_id?: number | null;
+  description: string;
+  quantity: number;
+  unit_code: string;
+  unit_price: number;
+  line_subtotal?: number;
+  unit_cost?: number;
+  cost_total?: number;
+  margin_total?: number;
+  margin_percent?: number;
+  margin_total_net?: number;
+  margin_percent_net?: number;
+  margin_total_commercial?: number;
+  margin_percent_commercial?: number;
+  margin_source?: 'REAL' | 'ESTIMATED';
+  line_total: number;
+};
+
+export type CashReportDocument = {
+  id: number;
+  document_number: string;
+  document_kind: string;
+  customer_name: string;
+  customer_vehicle_id?: number | null;
+  vehicle_plate_snapshot?: string | null;
+  vehicle_brand_snapshot?: string | null;
+  vehicle_model_snapshot?: string | null;
+  payment_method_name: string | null;
+  total: number;
+  created_at: string;
+  user_name: string | null;
+  items: CashReportDocumentItem[];
+};
+
+export type CashReportMovement = {
+  id: number;
+  movement_type: 'IN' | 'OUT';
+  amount: number;
+  description: string | null;
+  ref_type: string | null;
+  movement_at: string;
+};
+
+function isCashMovementFromSales(refType: string | null | undefined): boolean {
+  const normalized = String(refType ?? '').trim().toUpperCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return [
+    'COMMERCIAL_DOCUMENT',
+    'COMMERCIAL_DOCUMENT_EDIT',
+    'COMMERCIAL_DOCUMENT_VOID',
+    'INVOICE',
+    'RECEIPT',
+    'SALES_ORDER',
+    'QUOTATION',
+    'CREDIT_NOTE',
+    'DEBIT_NOTE',
+  ].includes(normalized);
+}
+
+function splitCashMovementsByOrigin(movements: CashReportMovement[]): { manual: CashReportMovement[]; sales: CashReportMovement[] } {
+  const manual: CashReportMovement[] = [];
+  const sales: CashReportMovement[] = [];
+
+  for (const movement of movements) {
+    if (isCashMovementFromSales(movement.ref_type)) {
+      sales.push(movement);
+    } else {
+      manual.push(movement);
+    }
+  }
+
+  return { manual, sales };
+}
+
+function resolveCashMovementAmount(value: number | string | null | undefined): number {
+  const amount = Number(value ?? 0);
+  return Number.isFinite(amount) ? amount : 0;
+}
+
+function resolveCashMovementLabel(movement: CashReportMovement, origin: 'manual' | 'sales'): string {
+  const base = movement.movement_type === 'IN' ? 'Ingreso' : 'Salida';
+  return origin === 'sales' ? `${base} por venta` : `${base} manual`;
+}
+
+function isCashPaymentMethodName(value: string | null | undefined): boolean {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return normalized.includes('efect') || normalized.includes('cash') || normalized.includes('contado');
+}
+
+export type CashReportPrintData = {
+  cashRegisterCode: string;
+  cashRegisterName: string;
+  userName: string;
+  openedAt: string;
+  closedAt: string;
+  openingBalance: number;
+  closingBalance: number;
+  expectedBalance: number;
+  totalIn: number;
+  totalOut: number;
+  difference: number;
+  paymentMethodBreakdown: PaymentMethodBreakdown[];
+  movements?: CashReportMovement[];
+  documents?: CashReportDocument[];
+  showNetMargin?: boolean;
+  showVehicleInfo?: boolean;
+  company?: PrintableCompanyProfile | null;
+};
+
+function resolveCashItemMargin(item: CashReportDocumentItem): { costTotal: number; marginTotalNet: number; marginPercentNet: number; marginTotalCommercial: number; marginPercentCommercial: number } {
+  const lineNet = Number(item.line_subtotal ?? item.line_total ?? 0);
+  const lineGross = Number(item.line_total ?? 0);
+  const commercialCostFactor = lineNet > 0 && lineGross > 0
+    ? Math.max(1, lineGross / lineNet)
+    : 1;
+  if (lineNet <= 0 && lineGross <= 0) {
+    return { costTotal: 0, marginTotalNet: 0, marginPercentNet: 0, marginTotalCommercial: 0, marginPercentCommercial: 0 };
+  }
+
+  const providedCost = Number(item.cost_total ?? NaN);
+
+  // Prefer explicit dual-margin fields from backend
+  const providedMarginNet = Number(item.margin_total_net ?? item.margin_total ?? NaN);
+  const providedMarginCommercial = Number(item.margin_total_commercial ?? NaN);
+
+  if (Number.isFinite(providedMarginNet)) {
+    const costTotal = Number.isFinite(providedCost) ? providedCost : lineNet - providedMarginNet;
+    const commercialCostTotal = costTotal * commercialCostFactor;
+    const marginTotalCommercial = Number.isFinite(providedMarginCommercial) ? providedMarginCommercial : lineGross - commercialCostTotal;
+    return {
+      costTotal,
+      marginTotalNet: providedMarginNet,
+      marginPercentNet: lineNet > 0 ? (providedMarginNet / lineNet) * 100 : 0,
+      marginTotalCommercial,
+      marginPercentCommercial: lineGross > 0 ? (marginTotalCommercial / lineGross) * 100 : 0,
+    };
+  }
+
+  const estimatedMarginNet = Math.min(Math.max(lineNet * 0.22, 0), lineNet * 0.35);
+  const costTotal = Math.max(0, lineNet - estimatedMarginNet);
+  const commercialCostTotal = costTotal * commercialCostFactor;
+  const marginTotalCommercial = Math.max(0, lineGross - commercialCostTotal);
+  return {
+    costTotal,
+    marginTotalNet: estimatedMarginNet,
+    marginPercentNet: lineNet > 0 ? (estimatedMarginNet / lineNet) * 100 : 0,
+    marginTotalCommercial,
+    marginPercentCommercial: lineGross > 0 ? (marginTotalCommercial / lineGross) * 100 : 0,
+  };
+}
+
+function resolveCashVehicleSnapshot(doc: CashReportDocument): { plate: string; brand: string; model: string } {
+  const plate = String(doc.vehicle_plate_snapshot ?? '').trim() || '-';
+  const brand = String(doc.vehicle_brand_snapshot ?? '').trim() || '-';
+  const model = String(doc.vehicle_model_snapshot ?? '').trim() || '-';
+  return { plate, brand, model };
+}
+
+function resolveCashActorLabel(rawUser: string | null | undefined): { compact: string; seller: string; issuer: string } {
+  const raw = String(rawUser ?? '').trim();
+  if (!raw) {
+    return { compact: 'N/A', seller: 'N/A', issuer: 'N/A' };
+  }
+
+  const match = raw.match(/^\s*Solicita:\s*(.*?)\s*\|\s*Emite:\s*(.*?)\s*$/i);
+  if (match) {
+    const seller = (match[1] || '').trim() || 'N/A';
+    const issuer = (match[2] || '').trim() || 'N/A';
+    return {
+      compact: `Solicita: ${seller} | Emite: ${issuer}`,
+      seller,
+      issuer,
+    };
+  }
+
+  return {
+    compact: raw,
+    seller: raw,
+    issuer: raw,
+  };
+}
+
+export function buildCashReportHtml80mm(
+  data: CashReportPrintData,
+  options?: { embedded?: boolean },
+): string {
+  const isEmbedded = options?.embedded === true;
+  const showNetMargin = data.showNetMargin === true;
+  const company = resolvePrintableCompanyProfile(data);
+  const companyTitle = String(company.tradeName || company.legalName || 'SISTEMA FACTURACION').trim() || 'SISTEMA FACTURACION';
+  const companyTaxId = String(company.taxId || '').trim();
+  const paymentRows = data.paymentMethodBreakdown
+    .map((pm) => `
+      <tr>
+        <td>${escapeHtml(pm.payment_method_name)}</td>
+        <td class="ta-r">${pm.document_count}</td>
+        <td class="ta-r">${formatMoney(pm.total_amount)}</td>
+      </tr>`)
+    .join('');
+
+  const productMap = new Map<string, {
+    documentKind: string;
+    documentNumber: string;
+    sellerName: string;
+    vehiclePlate: string;
+    vehicleBrand: string;
+    vehicleModel: string;
+    description: string;
+    unitCode: string;
+    paymentMethod: string;
+    quantity: number;
+    netAmount: number;
+    grossAmount: number;
+    marginAmount: number;
+    marginAmountCommercial: number;
+  }>();
+  for (const doc of data.documents ?? []) {
+    const documentKind = cashDocumentKindLabel(doc.document_kind);
+    const documentNumber = (doc.document_number || '').trim() || '-';
+    const actor = resolveCashActorLabel(doc.user_name);
+    const sellerName = actor.compact;
+    const vehicleSnapshot = resolveCashVehicleSnapshot(doc);
+    const vehiclePlate = vehicleSnapshot.plate;
+    const vehicleBrand = vehicleSnapshot.brand;
+    const vehicleModel = vehicleSnapshot.model;
+    const paymentMethod = (doc.payment_method_name || '').trim() || '-';
+    for (const item of doc.items ?? []) {
+      const description = (item.description || '').trim() || 'Producto sin descripcion';
+      const unitCode = (item.unit_code || '').trim() || '-';
+      const lineNetAmount = Number(item.line_subtotal ?? item.line_total ?? 0);
+      const lineGrossAmount = Number(item.line_total || 0);
+      const key = `${documentKind.toLowerCase()}__${documentNumber.toLowerCase()}__${sellerName.toLowerCase()}__${description.toLowerCase()}__${unitCode.toLowerCase()}__${paymentMethod.toLowerCase()}__${(data.showVehicleInfo ? `${vehiclePlate.toLowerCase()}__${vehicleBrand.toLowerCase()}__${vehicleModel.toLowerCase()}` : '')}`;
+      const current = productMap.get(key);
+      const marginMeta = resolveCashItemMargin(item);
+
+      if (current) {
+        current.quantity += Number(item.quantity || 0);
+        current.netAmount += lineNetAmount;
+        current.grossAmount += lineGrossAmount;
+        current.marginAmount += marginMeta.marginTotalNet;
+        current.marginAmountCommercial += marginMeta.marginTotalCommercial;
+      } else {
+        productMap.set(key, {
+          documentKind,
+          documentNumber,
+          sellerName,
+          vehiclePlate,
+          vehicleBrand,
+          vehicleModel,
+          description,
+          unitCode,
+          paymentMethod,
+          quantity: Number(item.quantity || 0),
+          netAmount: lineNetAmount,
+          grossAmount: lineGrossAmount,
+          marginAmount: marginMeta.marginTotalNet,
+          marginAmountCommercial: marginMeta.marginTotalCommercial,
+        });
+      }
+    }
+  }
+
+  // Keep chronological document order from backend to match session movements and avoid confusion.
+  const productRowsData = Array.from(productMap.values());
+  const productRows = productRowsData
+    .map(
+      (row) => `
+        <tr>
+          <td style="font-size:8px">${escapeHtml(row.description)}</td>
+          <td style="font-size:8px">${escapeHtml(row.sellerName)}</td>
+          <td style="font-size:8px">${escapeHtml(row.paymentMethod)}</td>
+          <td class="ta-r" style="font-size:8px">${row.quantity.toFixed(2)}</td>
+          <td style="font-size:8px">${escapeHtml(row.documentKind)}</td>
+          <td style="font-size:8px">${escapeHtml(row.documentNumber)}</td>
+          ${data.showVehicleInfo ? `<td style="font-size:8px" class="vehicle-cell">
+            <div><b>Placa:</b> ${escapeHtml(row.vehiclePlate)}</div>
+            <div><b>Marca:</b> ${escapeHtml(row.vehicleBrand)}</div>
+            <div><b>Modelo:</b> ${escapeHtml(row.vehicleModel)}</div>
+          </td>` : ''}
+          <td class="ta-r" style="font-size:8px;font-weight:700">${formatMoney(row.grossAmount)}</td>
+          ${showNetMargin ? `<td class="ta-r" style="font-size:8px;color:${row.marginAmount >= 0 ? '#0f766e' : '#dc2626'};font-weight:700">${formatMoney(row.marginAmount)}</td>` : ''}
+          <td class="ta-r" style="font-size:8px;color:${row.marginAmountCommercial >= 0 ? '#0369a1' : '#dc2626'};font-weight:700">${formatMoney(row.marginAmountCommercial)}</td>
+        </tr>`,
+    )
+    .join('');
+
+  const totalProductQty = productRowsData.reduce((sum, row) => sum + row.quantity, 0);
+  const totalProductNet = productRowsData.reduce((sum, row) => sum + row.netAmount, 0);
+  const totalProductGross = productRowsData.reduce((sum, row) => sum + row.grossAmount, 0);
+  const totalProductMargin = productRowsData.reduce((sum, row) => sum + row.marginAmount, 0);
+  const totalProductMarginPercent = totalProductNet > 0 ? (totalProductMargin / totalProductNet) * 100 : 0;
+  const totalProductMarginCommercial = productRowsData.reduce((sum, row) => sum + row.marginAmountCommercial, 0);
+  const totalProductMarginCommercialPercent = totalProductGross > 0 ? (totalProductMarginCommercial / totalProductGross) * 100 : 0;
+  const movements = data.movements ?? [];
+  const cashMovementsByOrigin = splitCashMovementsByOrigin(movements);
+  const manualInTotal = cashMovementsByOrigin.manual
+    .filter((m) => m.movement_type === 'IN')
+    .reduce((s, m) => s + resolveCashMovementAmount(m.amount), 0);
+  const manualOutTotal = cashMovementsByOrigin.manual
+    .filter((m) => m.movement_type === 'OUT')
+    .reduce((s, m) => s + resolveCashMovementAmount(m.amount), 0);
+  const salesCashInTotal = data.paymentMethodBreakdown
+    .filter((pm) => isCashPaymentMethodName(pm.payment_method_name))
+    .reduce((sum, pm) => sum + Number(pm.total_amount || 0), 0);
+  const effectiveCashTotal = data.openingBalance + manualInTotal - manualOutTotal + salesCashInTotal;
+  const renderMovementRows = (rows: CashReportMovement[], origin: 'manual' | 'sales') => rows.length > 0
+    ? rows.map((m) => `
+                <tr>
+                  <td>${resolveCashMovementLabel(m, origin)}</td>
+                  <td class="ta-r" style="color:${m.movement_type === 'IN' ? '#059669' : '#dc2626'};font-weight:700">S/ ${formatMoney(resolveCashMovementAmount(m.amount))}</td>
+                  <td>${escapeHtml(m.description || '-')}</td>
+                </tr>`).join('')
+    : `<tr><td colspan="3" class="ta-c">Sin movimientos ${origin === 'sales' ? 'por ventas' : 'manuales'}</td></tr>`;
+
+  return `
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>REPORTE DE CAJA - ${escapeHtml(data.cashRegisterCode)}</title>
+        <style>
+          @media print { @page { size: 80mm auto; margin: 0; } .no-print { display: none !important; } }
+          * { box-sizing: border-box; }
+          body { margin: 0; font-family: Courier, monospace; color: #000; font-size: 10px; line-height: 1.3; background: #fff; }
+          body, body * { font-weight: 700; }
+          .sheet { width: 80mm; min-width: 300px; margin: 0 auto; padding: 6mm; }
+          .print-bar { background: linear-gradient(120deg, #0f172a 0%, #1e3a8a 100%); color: #fff; padding: 8px 12px; text-align: center; font-family: sans-serif; font-size: 13px; }
+          .print-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-radius: 8px; white-space: nowrap; }
+          .print-bar button { background: #fff; color: #0f172a; border: 1px solid #cbd5e1; padding: 5px 10px; font-size: 11px; font-weight: 700; border-radius: 8px; cursor: pointer; margin: 0 2px; }
+          .print-bar-title { font-size: 11px; font-weight: 700; letter-spacing: 0.2px; }
+          .header { text-align: center; border-bottom: 1px dashed #000; padding-bottom: 4mm; margin-bottom: 4mm; }
+          .header-logo { width: 22mm; height: 22mm; object-fit: contain; border: 1px solid #000; border-radius: 4px; margin: 0 auto 1mm; display: block; background: #fff; }
+          .header h1 { margin: 0; font-size: 12px; font-weight: 700; }
+          .header p { margin: 1px 0; font-size: 9px; }
+          .section { margin-bottom: 5mm; border-bottom: 1px dashed #000; padding-bottom: 4mm; }
+          .section-title { font-weight: 700; text-transform: uppercase; font-size: 9px; margin-bottom: 2mm; }
+          .row { display: flex; justify-content: space-between; margin: 1mm 0; font-size: 9px; }
+          .label { flex: 1.5; }
+          .value { text-align: right; flex: 1; }
+          table { width: 100%; border-collapse: collapse; margin: 1mm 0; }
+          .product-table { table-layout: fixed; }
+          th { text-align: left; font-weight: 700; font-size: 8px; border-bottom: 1px solid #000; padding: 1mm 0; }
+          td { padding: 0.8mm 1mm; font-size: 9px; vertical-align: top; }
+          .ta-r { text-align: right; }
+          .ta-c { text-align: center; }
+          .total-row { font-weight: 700; border-top: 1px solid #000; }
+          .vehicle-cell b { font-weight: 700; }
+          .vehicle-cell div { line-height: 1.25; }
+          .footer { text-align: center; font-size: 8px; color: #444; margin-top: 4mm; }
+        </style>
+      </head>
+      <body>
+        ${isEmbedded
+          ? ''
+          : `<div class="print-bar no-print">
+          <span class="print-bar-title">Vista Ticket 80mm</span>
+          <div>
+            <button onclick="window.print()">Imprimir</button>
+            <button onclick="window.close()">Cerrar</button>
+          </div>
+        </div>`}
+        <div class="sheet">
+          <div class="header">
+            ${company.logoUrl ? `<img src="${escapeHtml(company.logoUrl)}" alt="Logo" class="header-logo" />` : ''}
+            <p style="font-weight:700">${escapeHtml(companyTitle)}</p>
+            ${companyTaxId ? `<p>RUC: ${escapeHtml(companyTaxId)}</p>` : ''}
+            <h1>*** REPORTE DE CAJA ***</h1>
+            <p>${escapeHtml(data.cashRegisterName)}</p>
+            <p>Fecha: ${formatDateTime(data.closedAt || data.openedAt)}</p>
+          </div>
+
+          <div class="section">
+            <div class="section-title">INFO GENERAL</div>
+            <div class="row"><div class="label">Caja:</div><div class="value">${escapeHtml(data.cashRegisterCode)}</div></div>
+            <div class="row"><div class="label">Usuario:</div><div class="value">${escapeHtml(data.userName)}</div></div>
+            <div class="row"><div class="label">Apertura:</div><div class="value">${formatDateTime(data.openedAt)}</div></div>
+            ${data.closedAt ? `<div class="row"><div class="label">Cierre:</div><div class="value">${formatDateTime(data.closedAt)}</div></div>` : ''}
+          </div>
+
+          <div class="section">
+            <div class="section-title">SALDOS</div>
+            <div class="row"><div class="label">Saldo Inicial:</div><div class="value">S/ ${formatMoney(data.openingBalance)}</div></div>
+            <div class="row"><div class="label">Mov. efectivo (+):</div><div class="value">S/ ${formatMoney(manualInTotal)}</div></div>
+            <div class="row"><div class="label">Mov. efectivo (-):</div><div class="value">S/ ${formatMoney(manualOutTotal)}</div></div>
+            <div class="row"><div class="label">Ventas efectivo:</div><div class="value">S/ ${formatMoney(salesCashInTotal)}</div></div>
+            ${showNetMargin ? `<div class="row"><div class="label">Margen neto:</div><div class="value">S/ ${formatMoney(totalProductMargin)}</div></div>` : ''}
+            <div class="row"><div class="label">Margen comercial:</div><div class="value">S/ ${formatMoney(totalProductMarginCommercial)}</div></div>
+            <div class="row"><div class="label">Total efectivo:</div><div class="value">S/ ${formatMoney(effectiveCashTotal)}</div></div>
+            <div class="row" style="font-weight:700;border-top:1px solid #000;padding-top:1mm"><div class="label">Real:</div><div class="value">S/ ${formatMoney(data.closingBalance)}</div></div>
+            ${data.difference !== 0 ? `<div class="row" style="color:${data.difference >= 0 ? '#008000' : '#cc0000'}"><div class="label">Diferencia:</div><div class="value">${data.difference > 0 ? '+' : ''}S/ ${formatMoney(data.difference)}</div></div>` : ''}
+          </div>
+
+          <div class="section">
+            <div class="section-title">VENTAS POR TIPO DE PAGO</div>
+            <table>
+              <thead><tr><th>Tipo de Pago</th><th class="ta-c">Can.</th><th class="ta-r">Monto</th></tr></thead>
+              <tbody>
+                ${paymentRows || '<tr><td colspan="3" class="ta-c">Sin ventas</td></tr>'}
+                <tr class="total-row"><td>TOTAL</td><td class="ta-c">${data.paymentMethodBreakdown.reduce((s, p) => s + p.document_count, 0)}</td><td class="ta-r">${formatMoney(data.paymentMethodBreakdown.reduce((s, p) => s + p.total_amount, 0))}</td></tr>
+                <tr class="total-row"><td colspan="2">TOTAL NETO EN EFECTIVO</td><td class="ta-r">S/ ${formatMoney(effectiveCashTotal)}</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          ${productRows ? `
+          <div class="section">
+            <div class="section-title">PRODUCTOS VENDIDOS</div>
+            <table class="product-table">
+              <thead><tr><th>Producto</th><th>Solicita / Emite</th><th>Pago</th><th class="ta-r">Cant.</th><th>Comp.</th><th>Serie</th>${data.showVehicleInfo ? '<th>Vehículo</th>' : ''}<th class="ta-r">Total venta</th>${showNetMargin ? '<th class="ta-r">M. neto</th>' : ''}<th class="ta-r">M. comercial</th></tr></thead>
+              <tbody>
+                ${productRows}
+                <tr class="total-row"><td colspan="3">TOTAL</td><td class="ta-r">${totalProductQty.toFixed(2)}</td><td colspan="${data.showVehicleInfo ? '3' : '2'}"></td><td class="ta-r">${formatMoney(totalProductGross)}</td>${showNetMargin ? `<td class="ta-r">${formatMoney(totalProductMargin)}</td>` : ''}<td class="ta-r">${formatMoney(totalProductMarginCommercial)}</td></tr>
+              </tbody>
+            </table>
+          </div>` : ''}
+
+          ${cashMovementsByOrigin.manual.length > 0 ? `
+          <div class="section">
+            <div class="section-title">MOVIMIENTOS MANUALES</div>
+            <table>
+              <thead><tr><th>Tipo</th><th class="ta-r">Monto</th><th>Descripción</th></tr></thead>
+              <tbody>
+                ${renderMovementRows(cashMovementsByOrigin.manual, 'manual')}
+                <tr class="total-row"><td>TOTAL MANUALES</td><td class="ta-r">S/ ${formatMoney(cashMovementsByOrigin.manual.reduce((s, m) => s + (m.movement_type === 'IN' ? resolveCashMovementAmount(m.amount) : -resolveCashMovementAmount(m.amount)), 0))}</td><td></td></tr>
+              </tbody>
+            </table>
+          </div>` : ''}
+
+          <div class="footer">Emitido: ${new Date().toLocaleString('es-PE', { timeZone: 'America/Lima' })}</div>
+        </div>
+      </body>
+    </html>`;
+}
+
+export function buildCashReportHtmlA4(
+  data: CashReportPrintData,
+  options?: { embedded?: boolean },
+): string {
+  const isEmbedded = options?.embedded === true;
+  const showNetMargin = data.showNetMargin === true;
+  const company = resolvePrintableCompanyProfile(data);
+  const companyTitle = String(company.tradeName || company.legalName || 'SISTEMA FACTURACION').trim() || 'SISTEMA FACTURACION';
+  const companyTaxId = String(company.taxId || '').trim();
+  const paymentRows = data.paymentMethodBreakdown
+    .map((pm) => `
+      <tr>
+        <td>${escapeHtml(pm.payment_method_name)}</td>
+        <td class="ta-c">${pm.document_count}</td>
+        <td class="ta-r">S/ ${formatMoney(pm.total_amount)}</td>
+      </tr>`)
+    .join('');
+
+  const productMap = new Map<string, {
+    documentKind: string;
+    documentNumber: string;
+    sellerName: string;
+    vehiclePlate: string;
+    vehicleBrand: string;
+    vehicleModel: string;
+    description: string;
+    unitCode: string;
+    paymentMethod: string;
+    quantity: number;
+    netAmount: number;
+    grossAmount: number;
+    marginAmount: number;
+    marginAmountCommercial: number;
+  }>();
+  for (const doc of data.documents ?? []) {
+    const documentKind = cashDocumentKindLabel(doc.document_kind);
+    const documentNumber = (doc.document_number || '').trim() || '-';
+    const actor = resolveCashActorLabel(doc.user_name);
+    const sellerName = actor.compact;
+    const vehicleSnapshot = resolveCashVehicleSnapshot(doc);
+    const vehiclePlate = vehicleSnapshot.plate;
+    const vehicleBrand = vehicleSnapshot.brand;
+    const vehicleModel = vehicleSnapshot.model;
+    const paymentMethod = (doc.payment_method_name || '').trim() || '-';
+    for (const item of doc.items ?? []) {
+      const description = (item.description || '').trim() || 'Producto sin descripcion';
+      const unitCode = (item.unit_code || '').trim() || '-';
+      const lineNetAmount = Number(item.line_subtotal ?? item.line_total ?? 0);
+      const lineGrossAmount = Number(item.line_total || 0);
+      const key = `${documentKind.toLowerCase()}__${documentNumber.toLowerCase()}__${sellerName.toLowerCase()}__${description.toLowerCase()}__${unitCode.toLowerCase()}__${paymentMethod.toLowerCase()}__${(data.showVehicleInfo ? `${vehiclePlate.toLowerCase()}__${vehicleBrand.toLowerCase()}__${vehicleModel.toLowerCase()}` : '')}`;
+      const current = productMap.get(key);
+      const marginMeta = resolveCashItemMargin(item);
+
+      if (current) {
+        current.quantity += Number(item.quantity || 0);
+        current.netAmount += lineNetAmount;
+        current.grossAmount += lineGrossAmount;
+        current.marginAmount += marginMeta.marginTotalNet;
+        current.marginAmountCommercial += marginMeta.marginTotalCommercial;
+      } else {
+        productMap.set(key, {
+          documentKind,
+          documentNumber,
+          sellerName,
+          vehiclePlate,
+          vehicleBrand,
+          vehicleModel,
+          description,
+          unitCode,
+          paymentMethod,
+          quantity: Number(item.quantity || 0),
+          netAmount: lineNetAmount,
+          grossAmount: lineGrossAmount,
+          marginAmount: marginMeta.marginTotalNet,
+          marginAmountCommercial: marginMeta.marginTotalCommercial,
+        });
+      }
+    }
+  }
+
+  // Keep chronological document order from backend to match session movements and avoid confusion.
+  const productRowsData = Array.from(productMap.values());
+  const productRows = productRowsData
+    .map(
+      (row) => `
+      <tr>
+        <td>${escapeHtml(row.description)}</td>
+        <td>${escapeHtml(row.sellerName)}</td>
+        <td>${escapeHtml(row.paymentMethod)}</td>
+        <td class="ta-c">${escapeHtml(row.unitCode)}</td>
+        <td class="ta-r">${row.quantity.toFixed(3)}</td>
+        <td>${escapeHtml(row.documentKind)}</td>
+        <td>${escapeHtml(row.documentNumber)}</td>
+        ${data.showVehicleInfo ? `<td class="cash-vehicle-cell"><div><b>Placa:</b> ${escapeHtml(row.vehiclePlate)}</div><div><b>Marca:</b> ${escapeHtml(row.vehicleBrand)}</div><div><b>Modelo:</b> ${escapeHtml(row.vehicleModel)}</div></td>` : ''}
+        <td class="ta-r">S/ ${formatMoney(row.grossAmount)}</td>
+        ${showNetMargin ? `<td class="ta-r" style="color:${row.marginAmount >= 0 ? '#0f766e' : '#dc2626'}">S/ ${formatMoney(row.marginAmount)}</td>` : ''}
+        <td class="ta-r" style="color:${row.marginAmountCommercial >= 0 ? '#0369a1' : '#dc2626'}">S/ ${formatMoney(row.marginAmountCommercial)}</td>
+      </tr>`,
+    )
+    .join('');
+
+  const totalProductQty = productRowsData.reduce((sum, row) => sum + row.quantity, 0);
+  const totalProductNet = productRowsData.reduce((sum, row) => sum + row.netAmount, 0);
+  const totalProductGross = productRowsData.reduce((sum, row) => sum + row.grossAmount, 0);
+  const totalProductMargin = productRowsData.reduce((sum, row) => sum + row.marginAmount, 0);
+  const totalProductMarginPercent = totalProductNet > 0 ? (totalProductMargin / totalProductNet) * 100 : 0;
+  const totalProductMarginCommercial = productRowsData.reduce((sum, row) => sum + row.marginAmountCommercial, 0);
+  const totalProductMarginCommercialPercent = totalProductGross > 0 ? (totalProductMarginCommercial / totalProductGross) * 100 : 0;
+  const movements = data.movements ?? [];
+  const cashMovementsByOrigin = splitCashMovementsByOrigin(movements);
+  const manualInTotal = cashMovementsByOrigin.manual
+    .filter((m) => m.movement_type === 'IN')
+    .reduce((s, m) => s + resolveCashMovementAmount(m.amount), 0);
+  const manualOutTotal = cashMovementsByOrigin.manual
+    .filter((m) => m.movement_type === 'OUT')
+    .reduce((s, m) => s + resolveCashMovementAmount(m.amount), 0);
+  const salesCashInTotal = data.paymentMethodBreakdown
+    .filter((pm) => isCashPaymentMethodName(pm.payment_method_name))
+    .reduce((sum, pm) => sum + Number(pm.total_amount || 0), 0);
+  const effectiveCashTotal = data.openingBalance + manualInTotal - manualOutTotal + salesCashInTotal;
+  const renderMovementRows = (rows: CashReportMovement[], origin: 'manual' | 'sales') => rows.length > 0
+    ? rows.map((m) => `
+                <tr>
+                  <td>${resolveCashMovementLabel(m, origin)}</td>
+                  <td class="ta-r" style="color:${m.movement_type === 'IN' ? '#059669' : '#dc2626'};font-weight:700">S/ ${formatMoney(resolveCashMovementAmount(m.amount))}</td>
+                  <td>${escapeHtml(m.description || '-')}</td>
+                </tr>`).join('')
+    : `<tr><td colspan="3" class="ta-c">Sin movimientos ${origin === 'sales' ? 'por ventas' : 'manuales'}</td></tr>`;
+
+  return `
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>REPORTE DE CAJA - ${escapeHtml(data.cashRegisterCode)}</title>
+        <style>
+          @media print { @page { size: A4 portrait; margin: 12mm; } .no-print { display: none !important; } }
+          * { box-sizing: border-box; }
+          body { margin: 0; font-family: "Segoe UI", Tahoma, sans-serif; color: #1f2937; background: #fff; }
+          .print-bar { background: linear-gradient(120deg, #0f172a 0%, #1e3a8a 100%); color: #fff; padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; font-size: 14px; }
+          .print-bar button { background: #fff; color: #0f172a; border: 1px solid #cbd5e1; padding: 7px 16px; font-size: 13px; font-weight: 700; border-radius: 8px; cursor: pointer; margin-left: 8px; }
+          .page { max-width: ${isEmbedded ? '320mm' : '210mm'}; margin: 0 auto; padding: 14px; }
+          .header { text-align: center; border-bottom: 1px solid #cbd5e1; padding-bottom: 8px; margin-bottom: 10px; }
+          .header-logo { width: 88px; height: 88px; object-fit: contain; border: 1px solid #cbd5e1; border-radius: 8px; background: #fff; display: block; margin: 0 auto 6px; }
+          .header h1 { margin: 0; font-size: 18px; font-weight: 700; }
+          .header p { margin: 1px 0; font-size: 11px; color: #64748b; }
+          .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 8px; margin-bottom: 10px; }
+          .metric { border: 1px solid #d1d5db; border-radius: 6px; padding: 8px; }
+          .metric span { display: block; font-size: 10px; color: #64748b; }
+          .metric strong { display: block; margin-top: 2px; font-size: 14px; }
+          .kv { display: flex; justify-content: space-between; font-size: 11px; margin: 2px 0; }
+          .kv .k { font-weight: 600; color: #374151; }
+          .kv .v { text-align: right; color: #1f2937; }
+          .section { border: 1px solid #d1d5db; border-radius: 6px; padding: 10px; margin-bottom: 12px; }
+          .section-title { font-size: 12px; font-weight: 700; text-transform: uppercase; color: #1e40af; border-bottom: 1px solid #dbeafe; padding-bottom: 4px; margin-bottom: 8px; }
+          table { width: 100%; border-collapse: collapse; }
+          .cash-products-table { table-layout: fixed; }
+          thead th { background: #1e40af; color: #fff; font-size: 10px; text-align: left; padding: 6px 7px; }
+          tbody td { border-bottom: 1px solid #e5e7eb; padding: 5px 7px; font-size: 11px; vertical-align: top; }
+          .ta-r { text-align: right; }
+          .ta-c { text-align: center; }
+          .total-row { background: #f0f4ff; font-weight: 700; }
+          .cash-vehicle-cell b { font-weight: 700; }
+          .cash-vehicle-cell div { line-height: 1.25; }
+          .footer { text-align: center; font-size: 10px; color: #94a3b8; margin-top: 10px; padding-top: 8px; border-top: 1px solid #e5e7eb; }
+        </style>
+      </head>
+      <body>
+        ${isEmbedded
+          ? ''
+          : `<div class="print-bar no-print">
+          <span>Vista Previa - Reporte A4</span>
+          <div>
+            <button onclick="window.print()">Imprimir</button>
+            <button onclick="window.close()">Cerrar</button>
+          </div>
+        </div>`}
+        <div class="page">
+          <div class="header">
+            ${company.logoUrl ? `<img src="${escapeHtml(company.logoUrl)}" alt="Logo" class="header-logo" />` : ''}
+            <p style="font-weight:700;color:#0f172a">${escapeHtml(companyTitle)}</p>
+            ${companyTaxId ? `<p>RUC: ${escapeHtml(companyTaxId)}</p>` : ''}
+            <h1>REPORTE DE CIERRE DE CAJA</h1>
+            <p>${escapeHtml(data.cashRegisterName)}</p>
+            <p>Rango: ${formatDateTime(data.openedAt)} ${data.closedAt ? `a ${formatDateTime(data.closedAt)}` : 'a la fecha'}</p>
+            <p>Usuario: ${escapeHtml(data.userName)} | Caja: ${escapeHtml(data.cashRegisterCode)}</p>
+          </div>
+
+          <div class="summary-grid">
+            <article class="metric"><span>Saldo inicial</span><strong>S/ ${formatMoney(data.openingBalance)}</strong></article>
+            <article class="metric"><span>Total efectivo</span><strong>S/ ${formatMoney(effectiveCashTotal)}</strong></article>
+            <article class="metric"><span>Saldo real</span><strong>S/ ${formatMoney(data.closingBalance)}</strong></article>
+            <article class="metric"><span>Diferencia</span><strong style="color:${data.difference >= 0 ? '#059669' : '#dc2626'}">${data.difference > 0 ? '+' : ''}S/ ${formatMoney(data.difference)}</strong></article>
+            ${showNetMargin ? `<article class="metric"><span>Margen neto</span><strong style="color:${totalProductMargin >= 0 ? '#0f766e' : '#dc2626'}">S/ ${formatMoney(totalProductMargin)}</strong></article>` : ''}
+            <article class="metric"><span>Margen comercial</span><strong style="color:${totalProductMarginCommercial >= 0 ? '#0369a1' : '#dc2626'}">S/ ${formatMoney(totalProductMarginCommercial)}</strong></article>
+          </div>
+
+          <div class="section">
+            <div class="section-title">Totales por tipo de pago</div>
+            <table>
+              <thead><tr><th>Forma de pago</th><th class="ta-c" style="width:90px">Cantidad</th><th class="ta-r" style="width:130px">Monto</th></tr></thead>
+              <tbody>
+                ${paymentRows || '<tr><td colspan="3" class="ta-c">Sin ventas registradas</td></tr>'}
+                <tr class="total-row"><td>TOTAL</td><td class="ta-c">${data.paymentMethodBreakdown.reduce((s, p) => s + p.document_count, 0)}</td><td class="ta-r">S/ ${formatMoney(data.paymentMethodBreakdown.reduce((s, p) => s + p.total_amount, 0))}</td></tr>
+                <tr class="total-row"><td colspan="2">TOTAL NETO EN EFECTIVO</td><td class="ta-r">S/ ${formatMoney(effectiveCashTotal)}</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="section">
+            <div class="section-title">Productos vendidos en la sesion</div>
+            <table class="cash-products-table">
+              <thead><tr><th style="width:${data.showVehicleInfo ? '17%' : '22%'}">Producto</th><th style="width:${data.showVehicleInfo ? '11%' : '12%'}">Solicita / Emite</th><th style="width:${data.showVehicleInfo ? '9%' : '10%'}">Tipo de pago</th><th class="ta-c" style="width:5%">Unidad</th><th class="ta-r" style="width:${data.showVehicleInfo ? '6%' : '7%'}">Cantidad</th><th style="width:${data.showVehicleInfo ? '9%' : '9%'}">Tipo comprobante</th><th style="width:${data.showVehicleInfo ? '9%' : '9%'}">Serie-correlativo</th>${data.showVehicleInfo ? '<th style="width:13%">Vehículo</th>' : ''}<th class="ta-r" style="width:${data.showVehicleInfo ? '7%' : '9%'}">Total venta</th>${showNetMargin ? `<th class="ta-r" style="width:${data.showVehicleInfo ? '6%' : '8%'}">M. neto</th>` : ''}<th class="ta-r" style="width:${data.showVehicleInfo ? '6%' : '8%'}">M. comercial</th></tr></thead>
+              <tbody>
+                ${productRows || `<tr><td colspan="${showNetMargin ? (data.showVehicleInfo ? '11' : '10') : (data.showVehicleInfo ? '10' : '9')}" class="ta-c">Sin productos vendidos en la sesion</td></tr>`}
+                <tr class="total-row"><td colspan="4">Total general</td><td class="ta-r">${totalProductQty.toFixed(3)}</td><td colspan="${data.showVehicleInfo ? '3' : '2'}"></td><td class="ta-r">S/ ${formatMoney(totalProductGross)}</td>${showNetMargin ? `<td class="ta-r">S/ ${formatMoney(totalProductMargin)}</td>` : ''}<td class="ta-r">S/ ${formatMoney(totalProductMarginCommercial)}</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          ${cashMovementsByOrigin.manual.length > 0 ? `
+          <div class="section">
+            <div class="section-title">MOVIMIENTOS MANUALES</div>
+            <table>
+              <thead><tr><th style="width:15%">Tipo de movimiento</th><th class="ta-r" style="width:20%">Monto</th><th style="width:65%">Descripción</th></tr></thead>
+              <tbody>
+                ${renderMovementRows(cashMovementsByOrigin.manual, 'manual')}
+                <tr class="total-row"><td>TOTAL MANUALES</td><td class="ta-r">S/ ${formatMoney(cashMovementsByOrigin.manual.reduce((s, m) => s + (m.movement_type === 'IN' ? resolveCashMovementAmount(m.amount) : -resolveCashMovementAmount(m.amount)), 0))}</td><td></td></tr>
+              </tbody>
+            </table>
+          </div>` : ''}
+
+          <div class="footer">Reporte generado: ${new Date().toLocaleString('es-PE', { timeZone: 'America/Lima' })}</div>
+        </div>
+      </body>
+    </html>`;
+}
+
+export function openCashReportPrint80mm(data: CashReportPrintData): void {
+  const printWindow = window.open('', '_blank', 'width=460,height=780');
+  if (!printWindow) {
+    return;
+  }
+
+  printWindow.document.open();
+  printWindow.document.write(buildCashReportHtml80mm(data));
+  printWindow.document.close();
+  printWindow.focus();
+}
+
+export function openCashReportPrintA4(data: CashReportPrintData): void {
+  const printWindow = window.open('', '_blank', 'width=980,height=820');
+  if (!printWindow) {
+    return;
+  }
+
+  printWindow.document.open();
+  printWindow.document.write(buildCashReportHtmlA4(data));
+  printWindow.document.close();
+  printWindow.focus();
+}
